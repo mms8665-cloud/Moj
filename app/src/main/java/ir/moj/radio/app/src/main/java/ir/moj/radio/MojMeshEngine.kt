@@ -2,6 +2,8 @@ package ir.moj.radio
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -9,7 +11,6 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.ToneGenerator
-import android.net.ConnectivityManager
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -28,6 +29,7 @@ import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.roundToInt
 
 class MojMeshEngine(private val context: Context) {
 
@@ -35,20 +37,28 @@ class MojMeshEngine(private val context: Context) {
         const val DISCOVERY_UDP_PORT = 45454
         const val MESH_TCP_PORT = 45455
         const val MAX_FILE_SIZE_BYTES = 150L * 1024L * 1024L // 150 MB
-        const val CHUNK_SIZE = 32 * 1024 // 32 KB per chunk for reliable mesh relay
+        const val CHUNK_SIZE = 32 * 1024 // 32 KB
         const val AUDIO_SAMPLE_RATE = 16000
+        const val MAX_SIMULTANEOUS_CAMERAS = 2
+        const val APP_VERSION = "1.1.0"
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val prefs = context.getSharedPreferences("moj_prefs", Context.MODE_PRIVATE)
 
     val myNodeId: String = getOrCreateNodeId()
-    var myDeviceName: String = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
+
+    private val _nickname = MutableStateFlow(prefs.getString("nickname", "") ?: "")
+    val nickname: StateFlow<String> = _nickname.asStateFlow()
 
     private val _role = MutableStateFlow(NodeRole.NONE)
     val role: StateFlow<NodeRole> = _role.asStateFlow()
 
     private val _joinCode = MutableStateFlow("")
     val joinCode: StateFlow<String> = _joinCode.asStateFlow()
+
+    private val _lastManualIp = MutableStateFlow(prefs.getString("last_manual_ip", "") ?: "")
+    val lastManualIp: StateFlow<String> = _lastManualIp.asStateFlow()
 
     private val _myApprovalStatus = MutableStateFlow(MemberStatus.DISCONNECTED)
     val myApprovalStatus: StateFlow<MemberStatus> = _myApprovalStatus.asStateFlow()
@@ -74,20 +84,52 @@ class MojMeshEngine(private val context: Context) {
     private val _staApConcurrencySupported = MutableStateFlow(false)
     val staApConcurrencySupported: StateFlow<Boolean> = _staApConcurrencySupported.asStateFlow()
 
-    var isRogerBeepEnabled: Boolean = true
+    // وضعیت‌های اشتراک‌گذاری دوربین زنده (Live Camera Sharing)
+    private val _isSharingMyCamera = MutableStateFlow(false)
+    val isSharingMyCamera: StateFlow<Boolean> = _isSharingMyCamera.asStateFlow()
+
+    private val _useFrontCamera = MutableStateFlow(false)
+    val useFrontCamera: StateFlow<Boolean> = _useFrontCamera.asStateFlow()
+
+    private val _incomingCameraRequests = MutableStateFlow<List<CameraViewRequest>>(emptyList())
+    val incomingCameraRequests: StateFlow<List<CameraViewRequest>> = _incomingCameraRequests.asStateFlow()
+
+    private val _approvedCameraViewers = MutableStateFlow<Set<String>>(emptySet())
+    val approvedCameraViewers: StateFlow<Set<String>> = _approvedCameraViewers.asStateFlow()
+
+    private val _watchingCameraIds = MutableStateFlow<Set<String>>(emptySet())
+    val watchingCameraIds: StateFlow<Set<String>> = _watchingCameraIds.asStateFlow()
+
+    private val _remoteCameraFrames = MutableStateFlow>(emptyMap())
+    val remoteCameraFrames: StateFlow> = _remoteCameraFrames.asStateFlow()
+
+    var isRogerBeepEnabled: Boolean
+        get() = prefs.getBoolean("roger_beep", true)
+        set(value) = prefs.edit().putBoolean("roger_beep", value).apply()
+
+    var incomingVolumeGain: Float
+        get() = prefs.getFloat("volume_gain", 1.0f)
+        set(value) {
+            prefs.edit().putFloat("volume_gain", value.coerceIn(0.2f, 2.0f)).apply()
+            audioTrack?.setVolume(value.coerceIn(0.0f, 1.0f))
+        }
+
     var onNotificationEvent: ((title: String, body: String) -> Unit)? = null
 
     private var myAuthToken: String = ""
     private val networkSecret = UUID.randomUUID().toString()
+    private var lastFrameSentTime = 0L
 
-    // کش ضد حلقه (Anti-Loop LRU Cache) برای نگهداری ۲۰۰۰ بسته آخر
     private val seenPacketIds = Collections.synchronizedSet(
-        Collections.newSetFromMap(object : LinkedHashMap<String, Boolean>(2048, 0.75f, true) {
+        Collections.newSetFromMap(object : LinkedHashMap<String, Boolean>(2500, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?): Boolean {
-                return size > 2000
+                return size > 2200
             }
         })
     )
+
+    private val kickedNodeIds = Collections.synchronizedSet(mutableSetOf<String>())
+    private val revokedTokens = Collections.synchronizedSet(mutableSetOf<String>())
 
     private val peerConnections = ConcurrentHashMap<String, PeerConnection>()
     private val memberMap = ConcurrentHashMap<String, MemberNode>()
@@ -106,18 +148,30 @@ class MojMeshEngine(private val context: Context) {
     }
 
     private fun getOrCreateNodeId(): String {
-        val prefs = context.getSharedPreferences("moj_prefs", Context.MODE_PRIVATE)
         var id = prefs.getString("node_id", null)
         if (id == null) {
-            id = UUID.randomUUID().toString().substring(0, 12)
+            id = UUID.randomUUID().toString().replace("-", "").substring(0, 8).uppercase()
             prefs.edit().putString("node_id", id).apply()
         }
         return id
     }
 
-    /**
-     * بررسی واقعی پشتیبانی سخت‌افزار گوشی از هم‌زمانی Wi-Fi و Hotspot
-     */
+    fun saveNickname(newName: String): Boolean {
+        val clean = newName.trim()
+        if (clean.length !in 2..20) return false
+        prefs.edit().putString("nickname", clean).apply()
+        _nickname.value = clean
+        memberMap[myNodeId]?.let {
+            memberMap[myNodeId] = it.copy(nickname = clean)
+            updateMembersState()
+            if (_role.value == NodeRole.HOST) broadcastMemberList()
+        }
+        return true
+    }
+
+    val myDisplayName: String
+        get() = _nickname.value.ifBlank { "${Build.MANUFACTURER} ${Build.MODEL}".take(16) }
+
     fun checkHardwareConcurrency() {
         val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
         val supported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -147,7 +201,7 @@ class MojMeshEngine(private val context: Context) {
                 }
             }
         } catch (_: Exception) {}
-        _localIpAddress.value = "192.168.43.1 (پیش‌فرض هات‌اسپات)"
+        _localIpAddress.value = "192.168.43.1"
         return _localIpAddress.value
     }
 
@@ -168,11 +222,10 @@ class MojMeshEngine(private val context: Context) {
         }
     }
 
-    /**
-     * شروع شبکه به عنوان گوشی مرکزی (Host)
-     */
     fun startHostNetwork() {
         stopNetwork()
+        kickedNodeIds.clear()
+        revokedTokens.clear()
         refreshLocalIp()
         val code = MojSecurityUtils.generateJoinCode(8)
         _joinCode.value = code
@@ -182,7 +235,7 @@ class MojMeshEngine(private val context: Context) {
 
         val selfNode = MemberNode(
             nodeId = myNodeId,
-            deviceName = "$myDeviceName (مدیر)",
+            nickname = "$myDisplayName (مدیر)",
             ipAddress = _localIpAddress.value,
             status = MemberStatus.APPROVED,
             authToken = myAuthToken,
@@ -193,48 +246,55 @@ class MojMeshEngine(private val context: Context) {
 
         startTcpMeshServer()
         startUdpDiscoveryResponder()
-        _statusBanner.value = "شبکه مرکزی موج فعال شد | کد اتصال: $code"
+        _statusBanner.value = "شبکه مرکزی فعال شد | کد: $code | IP: ${_localIpAddress.value}"
     }
 
-    /**
-     * پیوستن به شبکه با کد ۸ کاراکتری و (اختیاری) آدرس IP دستی
-     */
     fun joinNetwork(inputCode: String, manualHostIp: String = "") {
         val cleanCode = inputCode.trim().uppercase()
         if (cleanCode.length !in 6..10) {
             _statusBanner.value = "خطا: کد اتصال باید بین ۶ تا ۱۰ کاراکتر باشد."
             return
         }
+        if (manualHostIp.isNotBlank()) {
+            prefs.edit().putString("last_manual_ip", manualHostIp.trim()).apply()
+            _lastManualIp.value = manualHostIp.trim()
+        }
         stopNetwork()
         refreshLocalIp()
         _joinCode.value = cleanCode
         _role.value = NodeRole.CLIENT
         _myApprovalStatus.value = MemberStatus.PENDING
-        _statusBanner.value = "در حال جستجوی شبکه موج با کد $cleanCode..."
+        _statusBanner.value = "در حال جستجو و اتصال به شبکه موج ($cleanCode)..."
 
-        // رله سرور در گوشی عضو هم روشن می‌شود تا بتواند به عنوان گره واسطه برای گوشی سوم عمل کند
         startTcpMeshServer()
         startUdpDiscoveryResponder()
 
         scope.launch {
-            var targetIp: String? = manualHostIp.trim().takeIf { it.isNotEmpty() }
+            val cleanManual = manualHostIp.trim().substringBefore(":")
+            val manualPort = manualHostIp.trim().substringAfter(":", "").toIntOrNull() ?: MESH_TCP_PORT
 
-            // ۱. تلاش برای کشف خودکار با UDP Broadcast
-            if (targetIp == null) {
-                targetIp = discoverHostViaUdp(cleanCode)
+            val candidateIps = LinkedHashSet<String>()
+            if (cleanManual.isNotEmpty()) candidateIps.add(cleanManual)
+
+            // ۱. کشف سریع از طریق UDP Broadcast در تمام زیرشبکه‌ها
+            discoverHostViaUdp(cleanCode)?.let { candidateIps.add(it) }
+
+            // ۲. بررسی آدرس Gateway هات‌اسپات و زیرشبکه فعلی گوشی
+            getGatewayIp()?.let { candidateIps.add(it) }
+            val myIp = _localIpAddress.value
+            if (myIp.count { it == '.' } == 3) {
+                val prefix = myIp.substringBeforeLast(".")
+                candidateIps.add("$prefix.1")
             }
-
-            // ۲. اگر برودکست مسدود بود، بررسی Gateway هات‌اسپات و IPهای استاندارد اندروید
-            val candidateIps = mutableListOf<String>()
-            if (targetIp != null) candidateIps.add(targetIp)
-            getGatewayIp()?.let { if (!candidateIps.contains(it)) candidateIps.add(it) }
-            listOf("192.168.43.1", "192.168.49.1", "192.168.137.1").forEach {
-                if (!candidateIps.contains(it)) candidateIps.add(it)
+            // ۳. آدرس‌های استاندارد هات‌اسپات در سامسونگ، شیائومی و اندروید خام
+            listOf("192.168.43.1", "192.168.49.1", "192.168.137.1", "192.168.1.1").forEach {
+                candidateIps.add(it)
             }
 
             var connected = false
             for (ip in candidateIps) {
-                if (connectToUpstreamNode(ip, cleanCode)) {
+                _statusBanner.value = "در حال امتحان اتصال به آدرس $ip:$manualPort..."
+                if (connectToUpstreamNode(ip, manualPort, cleanCode)) {
                     connected = true
                     break
                 }
@@ -242,8 +302,14 @@ class MojMeshEngine(private val context: Context) {
 
             if (!connected) {
                 _myApprovalStatus.value = MemberStatus.DISCONNECTED
-                _statusBanner.value = "گوشی مرکزی پیدا نشد. از اتصال Wi-Fi به هات‌اسپات مطمئن شوید یا IP را دستی وارد کنید."
+                _statusBanner.value = "اتصال برقرار نشد. از اتصال Wi-Fi به هات‌اسپات مطمئن شوید یا IP مدیر را وارد کرده و تلاش مجدد بزنید."
             }
+        }
+    }
+
+    fun retryConnection() {
+        if (_joinCode.value.isNotEmpty() && _role.value == NodeRole.CLIENT) {
+            joinNetwork(_joinCode.value, _lastManualIp.value)
         }
     }
 
@@ -252,7 +318,7 @@ class MojMeshEngine(private val context: Context) {
         try {
             socket = DatagramSocket()
             socket.broadcast = true
-            socket.soTimeout = 1800
+            socket.soTimeout = 1600
 
             val reqJson = JSONObject().apply {
                 put("cmd", "MOJ_DISCOVER")
@@ -260,8 +326,13 @@ class MojMeshEngine(private val context: Context) {
                 put("senderId", myNodeId)
             }.toString().toByteArray()
 
-            val targets = listOf("255.255.255.255", "192.168.43.255", "192.168.49.255")
-            for (bcast in targets) {
+            val bcastList = mutableSetOf("255.255.255.255", "192.168.43.255", "192.168.49.255")
+            val myIp = _localIpAddress.value
+            if (myIp.count { it == '.' } == 3) {
+                bcastList.add("${myIp.substringBeforeLast(".")}.255")
+            }
+
+            for (bcast in bcastList) {
                 try {
                     val pkt = DatagramPacket(reqJson, reqJson.size, InetAddress.getByName(bcast), DISCOVERY_UDP_PORT)
                     socket.send(pkt)
@@ -271,8 +342,7 @@ class MojMeshEngine(private val context: Context) {
             val buf = ByteArray(1024)
             val respPkt = DatagramPacket(buf, buf.size)
             socket.receive(respPkt)
-            val respStr = String(respPkt.data, 0, respPkt.length)
-            val respObj = JSONObject(respStr)
+            val respObj = JSONObject(String(respPkt.data, 0, respPkt.length))
             if (respObj.optString("cmd") == "MOJ_HERE" && respObj.optString("code") == code) {
                 return@withContext respPkt.address.hostAddress
             }
@@ -296,19 +366,16 @@ class MojMeshEngine(private val context: Context) {
                 while (isActive && !socket.isClosed) {
                     val pkt = DatagramPacket(buf, buf.size)
                     socket.receive(pkt)
-                    val msg = String(pkt.data, 0, pkt.length)
-                    val json = JSONObject(msg)
+                    val json = JSONObject(String(pkt.data, 0, pkt.length))
                     if (json.optString("cmd") == "MOJ_DISCOVER") {
                         val reqCode = json.optString("code")
-                        // هم گوشی مرکزی و هم گوشی‌های تأییدشده واسطه به درخواست کشف پاسخ می‌دهند
                         if (reqCode == _joinCode.value && _myApprovalStatus.value == MemberStatus.APPROVED) {
                             val reply = JSONObject().apply {
                                 put("cmd", "MOJ_HERE")
                                 put("code", _joinCode.value)
                                 put("nodeId", myNodeId)
                             }.toString().toByteArray()
-                            val respPkt = DatagramPacket(reply, reply.size, pkt.address, pkt.port)
-                            socket.send(respPkt)
+                            socket.send(DatagramPacket(reply, reply.size, pkt.address, pkt.port))
                         }
                     }
                 }
@@ -327,47 +394,78 @@ class MojMeshEngine(private val context: Context) {
 
                 while (isActive && !server.isClosed) {
                     val clientSocket = server.accept()
+                    clientSocket.tcpNoDelay = true
+                    clientSocket.keepAlive = true
                     handleSocketConnection(clientSocket)
                 }
             } catch (e: Exception) {
                 if (_role.value != NodeRole.NONE) {
-                    _statusBanner.value = "خطا در پورت شبکه محلی: ${e.localizedMessage}"
+                    _statusBanner.value = "خطا در سوکت شبکه: ${e.localizedMessage}"
                 }
             }
         }
     }
 
-    private suspend fun connectToUpstreamNode(ip: String, code: String): Boolean = withContext(Dispatchers.IO) {
+    private suspend fun connectToUpstreamNode(ip: String, port: Int, code: String): Boolean = withContext(Dispatchers.IO) {
         return@withContext try {
             val socket = Socket()
-            socket.connect(InetSocketAddress(ip, MESH_TCP_PORT), 3000)
+            socket.tcpNoDelay = true
+            socket.keepAlive = true
+            socket.connect(InetSocketAddress(ip, port), 2500)
             val peer = handleSocketConnection(socket)
 
             val joinPayload = JSONObject().apply {
                 put("joinCode", code)
-                put("deviceName", myDeviceName)
+                put("nickname", myDisplayName)
                 put("ipAddress", _localIpAddress.value)
             }
-            val joinPacket = MeshPacket(
-                type = "JOIN_REQ",
-                senderId = myNodeId,
-                senderName = myDeviceName,
-                targetId = "HOST",
-                payload = joinPayload
+            val joinPacket = signPacket(
+                MeshPacket(
+                    type = "JOIN_REQ",
+                    senderId = myNodeId,
+                    senderName = myDisplayName,
+                    targetId = "HOST",
+                    payload = joinPayload
+                )
             )
             seenPacketIds.add(joinPacket.packetId)
             peer.sendLine(joinPacket.toJsonString())
-            _statusBanner.value = "درخواست ورود به مدیر ارسال شد. منتظر تأیید مدیر بمانید..."
+            _statusBanner.value = "متصل به $ip | درخواست ورود ارسال شد. منتظر تأیید مدیر بمانید..."
             true
         } catch (e: Exception) {
             false
         }
     }
 
+    private fun signPacket(packet: MeshPacket): MeshPacket {
+        val code = _joinCode.value
+        val hmac = MojSecurityUtils.computeHmac(
+            packet.packetId,
+            packet.type,
+            packet.senderId,
+            packet.payload.toString(),
+            code
+        )
+        return packet.copy(hmac = hmac)
+    }
+
+    private fun verifyPacketHmac(packet: MeshPacket): Boolean {
+        val code = _joinCode.value
+        if (code.isEmpty()) return false
+        val expected = MojSecurityUtils.computeHmac(
+            packet.packetId,
+            packet.type,
+            packet.senderId,
+            packet.payload.toString(),
+            code
+        )
+        return expected.isNotEmpty() && expected == packet.hmac
+    }
+
     private fun handleSocketConnection(socket: Socket): PeerConnection {
         val peer = PeerConnection(socket)
-        val tempId = "peer_${UUID.randomUUID()}"
-        peerConnections[tempId] = peer
+        val connId = "peer_${UUID.randomUUID()}"
+        peerConnections[connId] = peer
 
         scope.launch {
             try {
@@ -380,16 +478,17 @@ class MojMeshEngine(private val context: Context) {
                 }
             } catch (_: Exception) {
             } finally {
-                peerConnections.remove(tempId)
+                peerConnections.remove(connId)
                 peer.remoteNodeId?.let { nodeId ->
+                    _remoteCameraFrames.value = _remoteCameraFrames.value - nodeId
+                    _watchingCameraIds.value = _watchingCameraIds.value - nodeId
                     memberMap[nodeId]?.let { member ->
                         if (member.status == MemberStatus.APPROVED) {
                             member.status = MemberStatus.DISCONNECTED
+                            member.isSharingCamera = false
                             updateMembersState()
-                            onNotificationEvent?.invoke("قطع ارتباط عضو", "${member.deviceName} از شبکه قطع شد.")
-                            if (_role.value == NodeRole.HOST) {
-                                broadcastMemberList()
-                            }
+                            onNotificationEvent?.invoke("قطع ارتباط عضو", "${member.displayTitle} از شبکه خارج شد.")
+                            if (_role.value == NodeRole.HOST) broadcastMemberList()
                         }
                     }
                 }
@@ -403,20 +502,30 @@ class MojMeshEngine(private val context: Context) {
         // ۱. جلوگیری از حلقه و بسته‌های تکراری
         if (!seenPacketIds.add(packet.packetId)) return
 
-        // ۲. بررسی درخواست ورود در گوشی مدیر
+        // ۲. بررسی امضای HMAC برای جلوگیری از دست‌کاری
+        if (!verifyPacketHmac(packet)) return
+
+        // ۳. بررسی مسدود نبودن فرستنده
+        if (kickedNodeIds.contains(packet.senderId) || (packet.authToken.isNotEmpty() && revokedTokens.contains(packet.authToken))) {
+            return
+        }
+
+        // ۴. مدیریت درخواست ورود در گوشی مدیر
         if (packet.type == "JOIN_REQ") {
             if (_role.value == NodeRole.HOST) {
                 val reqCode = packet.payload.optString("joinCode")
                 if (reqCode != _joinCode.value) {
-                    val rejectPkt = MeshPacket(
-                        type = "JOIN_RES",
-                        senderId = myNodeId,
-                        senderName = myDeviceName,
-                        targetId = packet.senderId,
-                        payload = JSONObject().apply {
-                            put("status", MemberStatus.REJECTED.name)
-                            put("reason", "کد اتصال نامعتبر است.")
-                        }
+                    val rejectPkt = signPacket(
+                        MeshPacket(
+                            type = "JOIN_RES",
+                            senderId = myNodeId,
+                            senderName = myDisplayName,
+                            targetId = packet.senderId,
+                            payload = JSONObject().apply {
+                                put("status", MemberStatus.REJECTED.name)
+                                put("reason", "کد اتصال اشتباه است.")
+                            }
+                        )
                     )
                     sourcePeer.sendLine(rejectPkt.toJsonString())
                     return
@@ -424,38 +533,42 @@ class MojMeshEngine(private val context: Context) {
                 val existing = memberMap[packet.senderId]
                 val member = MemberNode(
                     nodeId = packet.senderId,
-                    deviceName = packet.senderName,
+                    nickname = packet.payload.optString("nickname", packet.senderName),
                     ipAddress = packet.payload.optString("ipAddress", remoteIp),
-                    status = existing?.status ?: MemberStatus.PENDING,
+                    status = if (existing?.status == MemberStatus.APPROVED) MemberStatus.APPROVED else MemberStatus.PENDING,
                     authToken = existing?.authToken ?: "",
                     hopCount = packet.hopCount
                 )
                 memberMap[packet.senderId] = member
                 updateMembersState()
-                onNotificationEvent?.invoke("درخواست ورود جدید", "${packet.senderName} درخواست پیوستن به شبکه موج را دارد.")
+                onNotificationEvent?.invoke("درخواست ورود جدید", "${member.displayTitle} درخواست ورود به شبکه موج را دارد.")
             } else {
-                // اگر گوشی واسطه است، درخواست را به سمت مدیر رله کن
                 relayPacket(packet, sourcePeer)
             }
             return
         }
 
-        // ۳. بررسی پاسخ تأیید/رد/اخراج
+        // ۵. پاسخ ورود یا اخراج عضو
         if (packet.type == "JOIN_RES") {
             if (packet.targetId == myNodeId) {
                 val st = MemberStatus.valueOf(packet.payload.optString("status", "REJECTED"))
                 _myApprovalStatus.value = st
-                if (st == MemberStatus.APPROVED) {
-                    myAuthToken = packet.payload.optString("authToken", "")
-                    _statusBanner.value = "عضویت شما توسط مدیر تأیید شد. به شبکه موج متصل هستید."
-                    onNotificationEvent?.invoke("تأیید عضویت", "ورود شما به شبکه موج تأیید شد.")
-                } else if (st == MemberStatus.REJECTED) {
-                    myAuthToken = ""
-                    _statusBanner.value = "درخواست ورود شما توسط مدیر رد شد."
-                } else if (st == MemberStatus.KICKED) {
-                    myAuthToken = ""
-                    _statusBanner.value = "شما توسط مدیر از شبکه حذف شدید."
-                    stopNetwork()
+                when (st) {
+                    MemberStatus.APPROVED -> {
+                        myAuthToken = packet.payload.optString("authToken", "")
+                        _statusBanner.value = "عضویت تأیید شد | متصل به شبکه موج (${_joinCode.value})"
+                        onNotificationEvent?.invoke("تأیید ورود", "ورود شما به شبکه موج تأیید شد.")
+                    }
+                    MemberStatus.REJECTED -> {
+                        myAuthToken = ""
+                        _statusBanner.value = "درخواست ورود شما توسط مدیر رد شد."
+                    }
+                    MemberStatus.KICKED -> {
+                        myAuthToken = ""
+                        _statusBanner.value = "شما توسط مدیر از شبکه حذف شدید."
+                        stopNetwork()
+                    }
+                    else -> {}
                 }
             } else {
                 relayPacket(packet, sourcePeer)
@@ -463,28 +576,27 @@ class MojMeshEngine(private val context: Context) {
             return
         }
 
-        // ۴. اعتبارسنجی امنیتی برای تمام بسته‌های دیگر
+        // ۶. احراز هویت اعضا در گوشی مرکزی و اعضا
         if (_role.value == NodeRole.HOST) {
             val senderNode = memberMap[packet.senderId]
             if (senderNode == null || senderNode.status != MemberStatus.APPROVED || senderNode.authToken != packet.authToken) {
-                return // مسدودسازی کامل اعضای غیرمجاز یا حذف‌شده
+                return
             }
             senderNode.lastSeen = System.currentTimeMillis()
         } else {
             if (_myApprovalStatus.value != MemberStatus.APPROVED) return
         }
 
-        // ۵. رله بسته به سایر گره‌ها در معماری Mesh (اگر TTL باقی مانده باشد)
+        // ۷. رله بسته به سایر گره‌ها (دریافت صدا و دیتا توسط مدیر و انتقال به بقیه)
         if (packet.targetId == "ALL" || packet.targetId != myNodeId) {
             relayPacket(packet, sourcePeer)
         }
 
-        // اگر بسته مخصوص گره دیگری بود، پردازش محلی نیازی نیست
-        if (packet.targetId != "ALL" && packet.targetId != myNodeId && _role.value != NodeRole.HOST) {
+        if (packet.targetId != "ALL" && packet.targetId != myNodeId) {
             return
         }
 
-        // ۶. پردازش محلی بر اساس نوع بسته
+        // ۸. پردازش محلی بسته
         when (packet.type) {
             "MEMBER_LIST" -> handleMemberListSync(packet.payload)
             "TEXT_MSG" -> handleIncomingText(packet)
@@ -494,6 +606,11 @@ class MojMeshEngine(private val context: Context) {
             "FILE_CHUNK" -> handleFileChunk(packet)
             "FILE_END" -> handleFileEnd(packet)
             "FILE_CANCEL" -> handleFileCancel(packet)
+            "CAM_STATE" -> handleCameraStateChange(packet)
+            "CAM_VIEW_REQ" -> handleCameraViewRequest(packet)
+            "CAM_VIEW_RES" -> handleCameraViewResponse(packet)
+            "CAM_STOP_VIEW" -> handleCameraStopView(packet)
+            "CAM_FRAME" -> handleIncomingCameraFrame(packet)
         }
     }
 
@@ -509,17 +626,16 @@ class MojMeshEngine(private val context: Context) {
     }
 
     private fun broadcastPacket(packet: MeshPacket) {
-        seenPacketIds.add(packet.packetId)
-        val raw = packet.toJsonString()
+        val signed = signPacket(packet)
+        seenPacketIds.add(signed.packetId)
+        val raw = signed.toJsonString()
         peerConnections.values.forEach { it.sendLine(raw) }
     }
 
-    /**
-     * تأیید عضو جدید توسط مدیر شبکه
-     */
     fun approveMember(nodeId: String) {
         if (_role.value != NodeRole.HOST) return
         val member = memberMap[nodeId] ?: return
+        kickedNodeIds.remove(nodeId)
         val token = MojSecurityUtils.generateAuthToken(nodeId, networkSecret)
         member.status = MemberStatus.APPROVED
         member.authToken = token
@@ -528,7 +644,7 @@ class MojMeshEngine(private val context: Context) {
         val resPkt = MeshPacket(
             type = "JOIN_RES",
             senderId = myNodeId,
-            senderName = myDeviceName,
+            senderName = myDisplayName,
             targetId = nodeId,
             authToken = myAuthToken,
             payload = JSONObject().apply {
@@ -540,26 +656,29 @@ class MojMeshEngine(private val context: Context) {
         broadcastMemberList()
     }
 
-    /**
-     * رد درخواست یا حذف عضو توسط مدیر شبکه
-     */
     fun rejectOrKickMember(nodeId: String, isKick: Boolean) {
         if (_role.value != NodeRole.HOST) return
         val member = memberMap[nodeId] ?: return
+        if (isKick) {
+            kickedNodeIds.add(nodeId)
+            if (member.authToken.isNotEmpty()) revokedTokens.add(member.authToken)
+        }
         val newStatus = if (isKick) MemberStatus.KICKED else MemberStatus.REJECTED
         member.status = newStatus
         member.authToken = ""
+        member.isSharingCamera = false
+        _approvedCameraViewers.value = _approvedCameraViewers.value - nodeId
+        _watchingCameraIds.value = _watchingCameraIds.value - nodeId
+        _remoteCameraFrames.value = _remoteCameraFrames.value - nodeId
         updateMembersState()
 
         val resPkt = MeshPacket(
             type = "JOIN_RES",
             senderId = myNodeId,
-            senderName = myDeviceName,
+            senderName = myDisplayName,
             targetId = nodeId,
             authToken = myAuthToken,
-            payload = JSONObject().apply {
-                put("status", newStatus.name)
-            }
+            payload = JSONObject().apply { put("status", newStatus.name) }
         )
         broadcastPacket(resPkt)
         broadcastMemberList()
@@ -571,16 +690,17 @@ class MojMeshEngine(private val context: Context) {
         memberMap.values.forEach { m ->
             arr.put(JSONObject().apply {
                 put("nodeId", m.nodeId)
-                put("deviceName", m.deviceName)
+                put("nickname", m.nickname)
                 put("ipAddress", m.ipAddress)
                 put("status", m.status.name)
                 put("hopCount", m.hopCount)
+                put("isSharingCamera", m.isSharingCamera)
             })
         }
         val pkt = MeshPacket(
             type = "MEMBER_LIST",
             senderId = myNodeId,
-            senderName = myDeviceName,
+            senderName = myDisplayName,
             authToken = myAuthToken,
             payload = JSONObject().apply { put("members", arr) }
         )
@@ -593,45 +713,47 @@ class MojMeshEngine(private val context: Context) {
         val list = mutableListOf<MemberNode>()
         for (i in 0 until arr.length()) {
             val obj = arr.getJSONObject(i)
-            list.add(
-                MemberNode(
-                    nodeId = obj.getString("nodeId"),
-                    deviceName = obj.getString("deviceName"),
-                    ipAddress = obj.optString("ipAddress", ""),
-                    status = MemberStatus.valueOf(obj.optString("status", "APPROVED")),
-                    hopCount = obj.optInt("hopCount", 1)
-                )
+            val m = MemberNode(
+                nodeId = obj.getString("nodeId"),
+                nickname = obj.optString("nickname", "کاربر"),
+                ipAddress = obj.optString("ipAddress", ""),
+                status = MemberStatus.valueOf(obj.optString("status", "APPROVED")),
+                hopCount = obj.optInt("hopCount", 1),
+                isSharingCamera = obj.optBoolean("isSharingCamera", false)
             )
+            memberMap[m.nodeId] = m
+            list.add(m)
         }
-        _members.value = list
+        _members.value = list.sortedBy { it.nickname }
     }
 
     private fun updateMembersState() {
-        _members.value = memberMap.values.sortedBy { it.deviceName }
+        _members.value = memberMap.values.sortedBy { it.nickname }
     }
 
     /**
-     * ارسال پیام متنی در شبکه Mesh
+     * ارسال پیام متنی رمزنگاری‌شده با AES-GCM
      */
     fun sendTextMessage(text: String) {
         val clean = text.trim()
         if (clean.isEmpty() || _myApprovalStatus.value != MemberStatus.APPROVED) return
         val msg = ChatMessage(
             senderId = myNodeId,
-            senderName = myDeviceName,
+            senderName = myDisplayName,
             text = clean,
             isIncoming = false
         )
         _messages.value = _messages.value + msg
 
+        val cipherText = MojSecurityUtils.encryptAesGcm(clean, _joinCode.value)
         val pkt = MeshPacket(
             type = "TEXT_MSG",
             senderId = myNodeId,
-            senderName = myDeviceName,
+            senderName = myDisplayName,
             authToken = myAuthToken,
             payload = JSONObject().apply {
                 put("msgId", msg.id)
-                put("text", clean)
+                put("cipher", cipherText)
                 put("timestamp", msg.timestamp)
             }
         )
@@ -639,11 +761,17 @@ class MojMeshEngine(private val context: Context) {
     }
 
     private fun handleIncomingText(packet: MeshPacket) {
+        val cipher = packet.payload.optString("cipher", "")
+        val plain = if (cipher.isNotEmpty()) {
+            MojSecurityUtils.decryptAesGcm(cipher, _joinCode.value) ?: return
+        } else {
+            packet.payload.optString("text", "")
+        }
         val msg = ChatMessage(
             id = packet.payload.optString("msgId", UUID.randomUUID().toString()),
             senderId = packet.senderId,
             senderName = packet.senderName,
-            text = packet.payload.optString("text", ""),
+            text = plain,
             timestamp = packet.payload.optLong("timestamp", System.currentTimeMillis()),
             isIncoming = true
         )
@@ -652,28 +780,27 @@ class MojMeshEngine(private val context: Context) {
     }
 
     /**
-     * بی‌سیم صوتی زنده (Push-To-Talk) با مدیریت نوبت صحبت
+     * بی‌سیم صوتی دوطرفه (Push-To-Talk) فعال در پیش‌زمینه و پس‌زمینه
      */
     @SuppressLint("MissingPermission")
     fun startPushToTalk(): Boolean {
         if (_myApprovalStatus.value != MemberStatus.APPROVED) {
-            _statusBanner.value = "شما هنوز مجوز ارسال در شبکه را ندارید."
+            _statusBanner.value = "شما هنوز تأیید نشده‌اید."
             return false
         }
         val currentSpeaker = _activeSpeaker.value
-        if (currentSpeaker != null && currentSpeaker != myDeviceName) {
+        if (currentSpeaker != null && currentSpeaker != myDisplayName) {
             _statusBanner.value = "خط مشغول است: $currentSpeaker در حال صحبت است."
             return false
         }
 
         isPttRecording = true
-        _activeSpeaker.value = myDeviceName
+        _activeSpeaker.value = myDisplayName
 
-        // اعلام گرفتن نوبت میکروفون به کل شبکه
         val floorTakePkt = MeshPacket(
             type = "PTT_FLOOR",
             senderId = myNodeId,
-            senderName = myDeviceName,
+            senderName = myDisplayName,
             authToken = myAuthToken,
             payload = JSONObject().apply { put("action", "TAKE") }
         )
@@ -689,14 +816,14 @@ class MojMeshEngine(private val context: Context) {
             var recorder: AudioRecord? = null
             try {
                 recorder = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                     AUDIO_SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
                     minBuf * 2
                 )
                 recorder.startRecording()
-                val frameBuf = ByteArray(1280) // 40ms PCM audio frame (کمترین تأخیر ممکن)
+                val frameBuf = ByteArray(1280)
                 while (isActive && isPttRecording) {
                     val read = recorder.read(frameBuf, 0, frameBuf.size)
                     if (read > 0) {
@@ -704,7 +831,7 @@ class MojMeshEngine(private val context: Context) {
                         val audioPkt = MeshPacket(
                             type = "PTT_AUDIO",
                             senderId = myNodeId,
-                            senderName = myDeviceName,
+                            senderName = myDisplayName,
                             authToken = myAuthToken,
                             payload = JSONObject().apply { put("pcm", b64) }
                         )
@@ -712,7 +839,7 @@ class MojMeshEngine(private val context: Context) {
                     }
                 }
             } catch (e: Exception) {
-                _statusBanner.value = "خطای دسترسی به میکروفون: ${e.localizedMessage}"
+                _statusBanner.value = "خطای میکروفون: ${e.localizedMessage}"
             } finally {
                 try {
                     recorder?.stop()
@@ -732,7 +859,7 @@ class MojMeshEngine(private val context: Context) {
         val floorReleasePkt = MeshPacket(
             type = "PTT_FLOOR",
             senderId = myNodeId,
-            senderName = myDeviceName,
+            senderName = myDisplayName,
             authToken = myAuthToken,
             payload = JSONObject().apply { put("action", "RELEASE") }
         )
@@ -754,6 +881,9 @@ class MojMeshEngine(private val context: Context) {
 
     private fun initAudioPlayer() {
         try {
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            audioManager?.isSpeakerphoneOn = true
+
             val minBuf = AudioTrack.getMinBufferSize(
                 AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_OUT_MONO,
@@ -763,7 +893,7 @@ class MojMeshEngine(private val context: Context) {
             audioTrack = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
@@ -777,6 +907,7 @@ class MojMeshEngine(private val context: Context) {
                 .setBufferSizeInBytes(minBuf * 2)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
+            audioTrack?.setVolume(incomingVolumeGain.coerceIn(0.0f, 1.0f))
             audioTrack?.play()
         } catch (_: Exception) {}
     }
@@ -786,7 +917,22 @@ class MojMeshEngine(private val context: Context) {
         if (b64.isEmpty()) return
         _activeSpeaker.value = packet.senderName
         try {
+            if (audioTrack?.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                audioTrack?.play()
+            }
             val pcmBytes = Base64.decode(b64, Base64.NO_WRAP)
+            // اعمال تقویت صدا در صورت تنظیم بالای ۱۰۰٪
+            val gain = incomingVolumeGain
+            if (gain != 1.0f && pcmBytes.size >= 2) {
+                var i = 0
+                while (i < pcmBytes.size - 1) {
+                    val sample = ((pcmBytes[i + 1].toInt() shl 8) or (pcmBytes[i].toInt() and 0xFF)).toShort()
+                    val boosted = (sample * gain).roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                    pcmBytes[i] = (boosted.toInt() and 0xFF).toByte()
+                    pcmBytes[i + 1] = ((boosted.toInt() shr 8) and 0xFF).toByte()
+                    i += 2
+                }
+            }
             audioTrack?.write(pcmBytes, 0, pcmBytes.size)
         } catch (_: Exception) {}
     }
@@ -794,20 +940,186 @@ class MojMeshEngine(private val context: Context) {
     private fun playRogerBeep() {
         if (!isRogerBeepEnabled) return
         try {
-            val toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
-            toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 140)
+            val toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 85)
+            toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
         } catch (_: Exception) {}
     }
 
-    /**
-     * ارسال بخش‌بندی‌شده (Chunked) عکس و فایل تا ۱۵۰ مگابایت با بررسی SHA-256 و قابلیت لغو
-     */
+    // ==================== قابلیت اشتراک‌گذاری دوطرفه دوربین زنده ====================
+
+    fun toggleMyCameraSharing(enable: Boolean) {
+        if (_myApprovalStatus.value != MemberStatus.APPROVED) return
+        _isSharingMyCamera.value = enable
+        if (!enable) {
+            _approvedCameraViewers.value = emptySet()
+            _incomingCameraRequests.value = emptyList()
+        }
+        memberMap[myNodeId]?.isSharingCamera = enable
+        updateMembersState()
+
+        val pkt = MeshPacket(
+            type = "CAM_STATE",
+            senderId = myNodeId,
+            senderName = myDisplayName,
+            authToken = myAuthToken,
+            payload = JSONObject().apply { put("sharing", enable) }
+        )
+        scope.launch {
+            broadcastPacket(pkt)
+            if (_role.value == NodeRole.HOST) broadcastMemberList()
+        }
+    }
+
+    fun switchCameraLens() {
+        _useFrontCamera.value = !_useFrontCamera.value
+    }
+
+    fun requestWatchMemberCamera(targetNodeId: String) {
+        if (_myApprovalStatus.value != MemberStatus.APPROVED) return
+        if (_watchingCameraIds.value.size >= MAX_SIMULTANEOUS_CAMERAS && !_watchingCameraIds.value.contains(targetNodeId)) {
+            _statusBanner.value = "محدودیت پهنای باند شبکه محلی: حداکثر $MAX_SIMULTANEOUS_CAMERAS دوربین هم‌زمان قابل مشاهده است."
+            return
+        }
+        val pkt = MeshPacket(
+            type = "CAM_VIEW_REQ",
+            senderId = myNodeId,
+            senderName = myDisplayName,
+            targetId = targetNodeId,
+            authToken = myAuthToken
+        )
+        scope.launch { broadcastPacket(pkt) }
+        _statusBanner.value = "درخواست مشاهده دوربین ارسال شد. منتظر اجازه صاحب گوشی بمانید..."
+    }
+
+    fun respondToCameraRequest(requesterId: String, approved: Boolean) {
+        _incomingCameraRequests.value = _incomingCameraRequests.value.filterNot { it.requesterId == requesterId }
+        if (approved) {
+            _approvedCameraViewers.value = _approvedCameraViewers.value + requesterId
+        } else {
+            _approvedCameraViewers.value = _approvedCameraViewers.value - requesterId
+        }
+        val pkt = MeshPacket(
+            type = "CAM_VIEW_RES",
+            senderId = myNodeId,
+            senderName = myDisplayName,
+            targetId = requesterId,
+            authToken = myAuthToken,
+            payload = JSONObject().apply { put("approved", approved) }
+        )
+        scope.launch { broadcastPacket(pkt) }
+    }
+
+    fun revokeViewerAccess(viewerId: String) {
+        _approvedCameraViewers.value = _approvedCameraViewers.value - viewerId
+        val pkt = MeshPacket(
+            type = "CAM_VIEW_RES",
+            senderId = myNodeId,
+            senderName = myDisplayName,
+            targetId = viewerId,
+            authToken = myAuthToken,
+            payload = JSONObject().apply { put("approved", false) }
+        )
+        scope.launch { broadcastPacket(pkt) }
+    }
+
+    fun stopWatchingRemoteCamera(ownerNodeId: String) {
+        _watchingCameraIds.value = _watchingCameraIds.value - ownerNodeId
+        _remoteCameraFrames.value = _remoteCameraFrames.value - ownerNodeId
+        val pkt = MeshPacket(
+            type = "CAM_STOP_VIEW",
+            senderId = myNodeId,
+            senderName = myDisplayName,
+            targetId = ownerNodeId,
+            authToken = myAuthToken
+        )
+        scope.launch { broadcastPacket(pkt) }
+    }
+
+    fun broadcastMyCameraFrame(jpegBytes: ByteArray) {
+        if (!_isSharingMyCamera.value || _approvedCameraViewers.value.isEmpty()) return
+        val now = System.currentTimeMillis()
+        if (now - lastFrameSentTime < 180) return // ~5.5 FPS برای پایداری شبکه Mesh
+        lastFrameSentTime = now
+
+        val b64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+        val viewers = _approvedCameraViewers.value.toList()
+        scope.launch {
+            for (viewerId in viewers) {
+                val framePkt = MeshPacket(
+                    type = "CAM_FRAME",
+                    senderId = myNodeId,
+                    senderName = myDisplayName,
+                    targetId = viewerId,
+                    authToken = myAuthToken,
+                    payload = JSONObject().apply { put("jpeg", b64) }
+                )
+                broadcastPacket(framePkt)
+            }
+        }
+    }
+
+    private fun handleCameraStateChange(packet: MeshPacket) {
+        val sharing = packet.payload.optBoolean("sharing", false)
+        memberMap[packet.senderId]?.isSharingCamera = sharing
+        updateMembersState()
+        if (!sharing) {
+            _watchingCameraIds.value = _watchingCameraIds.value - packet.senderId
+            _remoteCameraFrames.value = _remoteCameraFrames.value - packet.senderId
+        }
+        if (_role.value == NodeRole.HOST) broadcastMemberList()
+    }
+
+    private fun handleCameraViewRequest(packet: MeshPacket) {
+        if (!_isSharingMyCamera.value) return
+        if (_incomingCameraRequests.value.none { it.requesterId == packet.senderId }) {
+            _incomingCameraRequests.value = _incomingCameraRequests.value + CameraViewRequest(
+                requesterId = packet.senderId,
+                requesterName = packet.senderName
+            )
+            onNotificationEvent?.invoke(
+                "درخواست مشاهده دوربین",
+                "${packet.senderName} درخواست مشاهده دوربین زنده شما را دارد."
+            )
+        }
+    }
+
+    private fun handleCameraViewResponse(packet: MeshPacket) {
+        val approved = packet.payload.optBoolean("approved", false)
+        if (approved) {
+            if (_watchingCameraIds.value.size < MAX_SIMULTANEOUS_CAMERAS) {
+                _watchingCameraIds.value = _watchingCameraIds.value + packet.senderId
+                _statusBanner.value = "دسترسی به دوربین زنده ${packet.senderName} تأیید شد."
+            }
+        } else {
+            _watchingCameraIds.value = _watchingCameraIds.value - packet.senderId
+            _remoteCameraFrames.value = _remoteCameraFrames.value - packet.senderId
+            _statusBanner.value = "مشاهده دوربین ${packet.senderName} متوقف یا رد شد."
+        }
+    }
+
+    private fun handleCameraStopView(packet: MeshPacket) {
+        _approvedCameraViewers.value = _approvedCameraViewers.value - packet.senderId
+    }
+
+    private fun handleIncomingCameraFrame(packet: MeshPacket) {
+        if (!_watchingCameraIds.value.contains(packet.senderId)) return
+        val b64 = packet.payload.optString("jpeg", "")
+        if (b64.isEmpty()) return
+        try {
+            val bytes = Base64.decode(b64, Base64.NO_WRAP)
+            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
+            _remoteCameraFrames.value = _remoteCameraFrames.value + (packet.senderId to bmp)
+        } catch (_: Exception) {}
+    }
+
+    // ==================== ارسال بخش‌بندی‌شده فایل و عکس ====================
+
     fun sendUriFile(uri: Uri, isImage: Boolean) {
         if (_myApprovalStatus.value != MemberStatus.APPROVED) return
         scope.launch {
             try {
                 val resolver = context.contentResolver
-                var fileName = "moj_file_${System.currentTimeMillis()}"
+                var fileName = if (isImage) "moj_img_${System.currentTimeMillis()}.jpg" else "moj_file_${System.currentTimeMillis()}"
                 var fileSize = 0L
                 val mimeType = resolver.getType(uri) ?: if (isImage) "image/jpeg" else "application/octet-stream"
 
@@ -821,11 +1133,10 @@ class MojMeshEngine(private val context: Context) {
                 }
 
                 if (fileSize > MAX_FILE_SIZE_BYTES) {
-                    _statusBanner.value = "خطا: حجم فایل بیش از حد مجاز (۱۵۰ مگابایت) است."
+                    _statusBanner.value = "خطا: حجم فایل بیش از ۱۵۰ مگابایت است."
                     return@launch
                 }
 
-                // محاسبه SHA-256 برای تضمین صحت فایل در مقصد
                 val digest = MessageDigest.getInstance("SHA-256")
                 var actualSize = 0L
                 resolver.openInputStream(uri)?.use { input ->
@@ -846,18 +1157,17 @@ class MojMeshEngine(private val context: Context) {
                     fileSize = fileSize,
                     mimeType = mimeType,
                     senderId = myNodeId,
-                    senderName = myDeviceName,
+                    senderName = myDisplayName,
                     sha256 = sha256Hex,
                     isImage = isImage,
                     isIncoming = false
                 )
                 _fileTransfers.value = _fileTransfers.value + transferItem
 
-                // ۱. ارسال بسته شروع فایل
                 val startPkt = MeshPacket(
                     type = "FILE_START",
                     senderId = myNodeId,
-                    senderName = myDeviceName,
+                    senderName = myDisplayName,
                     authToken = myAuthToken,
                     payload = JSONObject().apply {
                         put("transferId", transferId)
@@ -870,7 +1180,6 @@ class MojMeshEngine(private val context: Context) {
                 )
                 broadcastPacket(startPkt)
 
-                // ۲. ارسال بخش‌ها (Chunks) با قابلیت Resume از آفست مشخص
                 resolver.openInputStream(uri)?.use { input ->
                     val buf = ByteArray(CHUNK_SIZE)
                     var offset = 0L
@@ -881,7 +1190,7 @@ class MojMeshEngine(private val context: Context) {
                             val cancelPkt = MeshPacket(
                                 type = "FILE_CANCEL",
                                 senderId = myNodeId,
-                                senderName = myDeviceName,
+                                senderName = myDisplayName,
                                 authToken = myAuthToken,
                                 payload = JSONObject().apply { put("transferId", transferId) }
                             )
@@ -893,7 +1202,7 @@ class MojMeshEngine(private val context: Context) {
                         val chunkPkt = MeshPacket(
                             type = "FILE_CHUNK",
                             senderId = myNodeId,
-                            senderName = myDeviceName,
+                            senderName = myDisplayName,
                             authToken = myAuthToken,
                             payload = JSONObject().apply {
                                 put("transferId", transferId)
@@ -904,15 +1213,14 @@ class MojMeshEngine(private val context: Context) {
                         broadcastPacket(chunkPkt)
                         offset += read
                         updateFileProgress(transferId, offset, isCompleted = false)
-                        delay(12) // کنترل ازدحام شبکه محلی (Congestion Control)
+                        delay(10)
                     }
                 }
 
-                // ۳. اعلام پایان انتقال
                 val endPkt = MeshPacket(
                     type = "FILE_END",
                     senderId = myNodeId,
-                    senderName = myDeviceName,
+                    senderName = myDisplayName,
                     authToken = myAuthToken,
                     payload = JSONObject().apply {
                         put("transferId", transferId)
@@ -992,7 +1300,6 @@ class MojMeshEngine(private val context: Context) {
         val path = item.localFilePath ?: return
         val file = File(path)
 
-        // بررسی صحت SHA-256 فایل دریافتی
         scope.launch {
             val digest = MessageDigest.getInstance("SHA-256")
             FileInputStream(file).use { fis ->
@@ -1005,8 +1312,8 @@ class MojMeshEngine(private val context: Context) {
             val actualSha = digest.digest().joinToString("") { "%02x".format(it) }
             if (expectedSha.isEmpty() || actualSha.equals(expectedSha, ignoreCase = true)) {
                 updateFileProgress(transferId, item.fileSize, isCompleted = true)
-                val notifTitle = if (item.isImage) "دریافت تصویر جدید" else "دریافت فایل جدید"
-                onNotificationEvent?.invoke(notifTitle, "${item.fileName} از طرف ${item.senderName} دریافت و ذخیره شد.")
+                val notifTitle = if (item.isImage) "دریافت عکس جدید" else "دریافت فایل جدید"
+                onNotificationEvent?.invoke(notifTitle, "${item.fileName} از طرف ${item.senderName} دریافت شد.")
             } else {
                 _statusBanner.value = "خطا در بررسی صحت فایل دریافتی (${item.fileName})"
             }
@@ -1029,6 +1336,11 @@ class MojMeshEngine(private val context: Context) {
     fun stopNetwork() {
         isPttRecording = false
         pttJob?.cancel()
+        _isSharingMyCamera.value = false
+        _approvedCameraViewers.value = emptySet()
+        _watchingCameraIds.value = emptySet()
+        _remoteCameraFrames.value = emptyMap()
+        _incomingCameraRequests.value = emptyList()
         peerConnections.values.forEach { it.close() }
         peerConnections.clear()
         memberMap.clear()
