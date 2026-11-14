@@ -35,7 +35,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -50,7 +49,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
@@ -60,6 +58,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
+import androidx.lifecycle.LifecycleOwner
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.concurrent.Executors
@@ -84,7 +83,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // مدیریت استاندارد فضای امن نمایشگر و دکمه‌های ناوبری اندروید
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         val serviceIntent = Intent(this, MojForegroundService::class.java)
@@ -151,7 +149,6 @@ fun MojRootContainer(engine: MojMeshEngine) {
         permissionLauncher.launch(perms.toTypedArray())
     }
 
-    // ۱. دریافت اجباری نام مستعار در اولین ورود
     if (nickname.length !in 2..20) {
         MandatoryNicknameScreen(engine)
     } else {
@@ -378,10 +375,6 @@ fun MojMainNavigator(engine: MojMeshEngine) {
     }
 }
 
-/**
- * صفحه اصلی یکپارچه ارتباطی:
- * شامل بی‌سیم PTT، پیام متنی، ارسال عکس گالری، دوربین، فایل و دوربین زنده دوطرفه در یک صفحه
- */
 @Composable
 fun UnifiedCommunicationScreen(
     context: Context,
@@ -431,7 +424,6 @@ fun UnifiedCommunicationScreen(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        // نوار سریع اتصال یا دسترسی به دوربین زنده و راهنما
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -481,7 +473,6 @@ fun UnifiedCommunicationScreen(
             }
         }
 
-        // نمایش درخواست‌های دریافتی مشاهده دوربین (فقط صاحب گوشی اجازه تأیید دارد)
         incomingCamReqs.forEach { req ->
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -514,7 +505,6 @@ fun UnifiedCommunicationScreen(
             }
         }
 
-        // پنل اشتراک‌گذاری و مشاهده دوربین زنده
         if (showLiveCameraPanel && approvalStatus == MemberStatus.APPROVED) {
             LiveCameraSharingSection(
                 engine = engine,
@@ -527,7 +517,6 @@ fun UnifiedCommunicationScreen(
             )
         }
 
-        // بخش میانی: لیست یکپارچه پیام‌های متنی، عکس‌ها و فایل‌ها
         Card(
             modifier = Modifier
                 .weight(1f)
@@ -560,7 +549,6 @@ fun UnifiedCommunicationScreen(
             }
         }
 
-        // نوار یکپارچه ارسال پیام، عکس گالری، دوربین و فایل
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -615,7 +603,6 @@ fun UnifiedCommunicationScreen(
             }
         }
 
-        // دکمه بزرگ و قابل دسترس بی‌سیم (Push-To-Talk) در پایین صفحه اصلی
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -747,7 +734,6 @@ fun LiveCameraSharingSection(
                 }
             }
 
-            // فهرست اعضای در حال اشتراک‌گذاری دوربین
             val remoteSharers = members.filter { it.nodeId != engine.myNodeId && it.status == MemberStatus.APPROVED && it.isSharingCamera }
             if (remoteSharers.isNotEmpty()) {
                 Text("اعضای دارای دوربین آماده مشاهده:", fontSize = 12.sp, fontWeight = FontWeight.Bold)
@@ -769,7 +755,6 @@ fun LiveCameraSharingSection(
                 }
             }
 
-            // نمایش تصویر زنده دوربین‌های تأییدشده (پشتیبانی از مشاهده هم‌زمان)
             if (watchingIds.isNotEmpty()) {
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(watchingIds.toList()) { ownerId ->
@@ -823,11 +808,12 @@ fun LocalCameraPreviewAndAnalyzer(
     onFrameCaptured: (ByteArray) -> Unit
 ) {
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
+    val lifecycleOwner = context as? LifecycleOwner
     val previewView = remember { PreviewView(context) }
     val executor = remember { Executors.newSingleThreadExecutor() }
 
-    LaunchedEffect(useFrontCamera) {
+    LaunchedEffect(useFrontCamera, lifecycleOwner) {
+        if (lifecycleOwner == null) return@LaunchedEffect
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
             try {
@@ -985,9 +971,6 @@ fun FileTransferBubble(item: FileTransferItem, onCancel: () -> Unit) {
     }
 }
 
-/**
- * صفحه ۲: مدیریت شبکه، ورود با کد دستی و مدیریت اعضا
- */
 @Composable
 fun NetworkAndMembersScreen(
     engine: MojMeshEngine,
@@ -1069,7 +1052,7 @@ fun NetworkAndMembersScreen(
                         Text("ایجاد شبکه جدید (به عنوان گوشی مرکزی)")
                     }
 
-                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                    Spacer(Modifier.height(4.dp))
 
                     OutlinedTextField(
                         value = inputCode,
@@ -1167,9 +1150,6 @@ fun NetworkAndMembersScreen(
     }
 }
 
-/**
- * صفحه ۳: صفحه مستقل «راهنمای استفاده از موج» شامل هر ۱۴ بخش درخواستی
- */
 @Composable
 fun UserGuideScreen() {
     val guideSections = listOf(
@@ -1230,9 +1210,6 @@ fun UserGuideScreen() {
     }
 }
 
-/**
- * صفحه ۴: تنظیمات کامل برنامه
- */
 @Composable
 fun SettingsScreen(
     context: Context,
@@ -1310,7 +1287,7 @@ fun SettingsScreen(
                         )
                     }
 
-                    HorizontalDivider()
+                    Spacer(Modifier.height(4.dp))
 
                     Text("تنظیم بلندی صدای دریافتی بی‌سیم: ${(volumeGain * 100).toInt()}%", fontSize = 13.sp)
                     Slider(
