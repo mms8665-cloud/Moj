@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<paths>
-    <cache-path name="camera_photos" path="." />
-    <files-path name="moj_files" path="." />
-    <external-files-path name="external_moj_files" path="." />
-</paths>
