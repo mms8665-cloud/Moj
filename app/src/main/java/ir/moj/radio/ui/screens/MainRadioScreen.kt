@@ -1,0 +1,547 @@
+package ir.moj.radio.ui.screens
+
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.HelpOutline
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import ir.moj.radio.camera.CameraViewRequest
+import ir.moj.radio.camera.RemoteCameraStream
+import ir.moj.radio.data.NetworkMember
+import ir.moj.radio.file.TransferState
+import ir.moj.radio.network.DiscoveredNetwork
+import ir.moj.radio.ui.theme.*
+
+data class ChatItem(
+    val id: String,
+    val senderNickname: String,
+    val text: String,
+    val isMine: Boolean,
+    val timestampText: String
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MainRadioScreen(
+    myNickname: String,
+    networkName: String,
+    joinCode: String?,
+    isHost: Boolean,
+    isConnected: Boolean,
+    staApSupported: Boolean,
+    activeSpeaker: String?,
+    isTransmitting: Boolean,
+    isSharingMyCamera: Boolean,
+    messages: List<ChatItem>,
+    transfers: List<TransferState>,
+    members: List<NetworkMember>,
+    pendingJoinRequests: List<NetworkMember>,
+    pendingCameraRequests: List<CameraViewRequest>,
+    remoteCameras: List<RemoteCameraStream>,
+    discoveredNetworks: List<DiscoveredNetwork>,
+    onCreateNetwork: () -> Unit,
+    onJoinNetwork: (hostIp: String, port: Int, code: String) -> Unit,
+    onApproveMember: (String) -> Unit,
+    onRejectMember: (String) -> Unit,
+    onKickMember: (String) -> Unit,
+    onStartPtt: () -> Unit,
+    onStopPtt: () -> Unit,
+    onSendText: (String) -> Unit,
+    onPickGalleryImage: () -> Unit,
+    onTakeCameraPhoto: () -> Unit,
+    onPickFile: () -> Unit,
+    onCancelTransfer: (String) -> Unit,
+    onToggleMyCamera: () -> Unit,
+    onSwitchMyCamera: () -> Unit,
+    onRequestWatchCamera: (String) -> Unit,
+    onApproveCameraViewer: (String) -> Unit,
+    onRejectCameraViewer: (String) -> Unit,
+    onStopWatchingCamera: (String) -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenGuide: () -> Unit
+) {
+    var messageText by remember { mutableStateOf("") }
+    var showConnectDialog by remember { mutableStateOf(false) }
+    var showMembersSheet by remember { mutableStateOf(false) }
+
+    Scaffold(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MojNavyDark),
+        containerColor = MojNavyDark,
+        topBar = {
+            TopAppBar(
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MojNavySurface),
+                title = {
+                    Column {
+                        Text(
+                            text = if (isConnected) networkName else "موج (متصل نیست)",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (isConnected) {
+                                "کد شبکه: ${joinCode ?: "-"} | اعضا: ${members.size}"
+                            } else {
+                                "برای شروع، شبکه بسازید یا متصل شوید"
+                            },
+                            fontSize = 11.sp,
+                            color = if (isConnected) MojGreenOnline else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { showMembersSheet = true }) {
+                        BadgedBox(
+                            badge = {
+                                if (pendingJoinRequests.isNotEmpty()) {
+                                    Badge { Text("${pendingJoinRequests.size}") }
+                                }
+                            }
+                        ) {
+                            Icon(Icons.Default.Group, contentDescription = "اعضا")
+                        }
+                    }
+                    IconButton(onClick = onOpenGuide) {
+                        Icon(Icons.AutoMirrored.Filled.HelpOutline, contentDescription = "راهنما")
+                    }
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Default.Settings, contentDescription = "تنظیمات")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .navigationBarsPadding()
+                .imePadding()
+        ) {
+            // نوار وضعیت کاربر و دکمه‌های اتصال سریع
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MojNavyCard)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(if (isConnected) MojGreenOnline else Color.Gray)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "$myNickname ${if (isHost) "(مدیر شبکه)" else ""}",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                if (!isConnected) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilledTonalButton(
+                            onClick = onCreateNetwork,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text("ایجاد شبکه", fontSize = 12.sp)
+                        }
+                        OutlinedButton(
+                            onClick = { showConnectDialog = true },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text("اتصال با کد", fontSize = 12.sp)
+                        }
+                    }
+                } else if (isSharingMyCamera) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("دوربین شما فعال است", color = MojRedAlert, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        IconButton(onClick = onSwitchMyCamera, modifier = Modifier.size(30.dp)) {
+                            Icon(Icons.Default.Cameraswitch, contentDescription = "تغییر دوربین", tint = MojCyan)
+                        }
+                    }
+                }
+            }
+
+            // نمایش درخواست‌های مشاهده دوربین زنده (حریم خصوصی)
+            pendingCameraRequests.forEach { req ->
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MojNavyCard),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("${req.requesterNickname} درخواست دیدن دوربین شما را دارد", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { onApproveCameraViewer(req.requesterId) }) { Text("اجازه", color = MojGreenOnline) }
+                        TextButton(onClick = { onRejectCameraViewer(req.requesterId) }) { Text("رد", color = MojRedAlert) }
+                    }
+                }
+            }
+
+            // نمایش هم‌زمان دوربین‌های زنده دریافتی
+            if (remoteCameras.isNotEmpty()) {
+                LazyRow(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(155.dp)
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(remoteCameras, key = { it.ownerId }) { stream ->
+                        Box(
+                            modifier = Modifier
+                                .width(200.dp)
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.Black)
+                        ) {
+                            Image(
+                                bitmap = stream.latestFrame.asImageBitmap(),
+                                contentDescription = "دوربین ${stream.ownerNickname}",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                            Text(
+                                text = "زنده: ${stream.ownerNickname}",
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .background(Color.Black.copy(alpha = 0.6f))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                            IconButton(
+                                onClick = { onStopWatchingCamera(stream.ownerId) },
+                                modifier = Modifier.align(Alignment.TopEnd).size(28.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "بستن", tint = Color.White)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // بخش مرکزی: تاریخچه پیام‌ها و وضعیت انتقال فایل‌ها
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(vertical = 8.dp)
+            ) {
+                items(transfers, key = { it.transferId }) { transfer ->
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = MojNavyCard),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "${if (transfer.isOutgoing) "ارسال" else "دریافت"}: ${transfer.fileName}",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (!transfer.isCompleted && !transfer.isCancelled && !transfer.isFailed) {
+                                    TextButton(onClick = { onCancelTransfer(transfer.transferId) }) {
+                                        Text("لغو", color = MojRedAlert, fontSize = 12.sp)
+                                    }
+                                }
+                            }
+                            LinearProgressIndicator(
+                                progress = { transfer.progressPercent / 100f },
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                            )
+                            val statusLabel = when {
+                                transfer.isCompleted -> "تکمیل و تأیید شد (۱۰۰٪)"
+                                transfer.isCancelled -> "لغو شد"
+                                transfer.isFailed -> "خطا در انتقال یا صحت فایل"
+                                else -> "${transfer.progressPercent}٪"
+                            }
+                            Text(statusLabel, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+
+                items(messages, key = { it.id }) { msg ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = if (msg.isMine) Arrangement.Start else Arrangement.End
+                    ) {
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (msg.isMine) Color(0xFF0E3A5D) else MojNavyCard
+                            ),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier.widthIn(max = 290.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Text(
+                                    text = msg.senderNickname,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MojCyan
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(text = msg.text, fontSize = 14.sp)
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = msg.timestampText,
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // نوار وضعیت گوینده بی‌سیم و دکمه بزرگ Push To Talk
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MojNavySurface)
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                if (activeSpeaker != null) {
+                    Text(
+                        text = "در حال صحبت: $activeSpeaker",
+                        color = MojCyan,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
+
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(54.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(if (isTransmitting) MojRedAlert else MojElectricBlue)
+                        .pointerInput(isConnected) {
+                            detectTapGestures(
+                                onPress = {
+                                    if (isConnected) {
+                                        onStartPtt()
+                                        tryAwaitRelease()
+                                        onStopPtt()
+                                    }
+                                }
+                            )
+                        }
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Mic,
+                            contentDescription = "بی‌سیم",
+                            tint = Color.White
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (isTransmitting) "در حال ارسال صدا... (رها کنید)" else "نگه دارید و صحبت کنید (PTT)",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // کادر ارسال پیام و دکمه‌های رسانه
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onPickGalleryImage, enabled = isConnected) {
+                        Icon(Icons.Default.Photo, contentDescription = "گالری", tint = MojCyan)
+                    }
+                    IconButton(onClick = onTakeCameraPhoto, enabled = isConnected) {
+                        Icon(Icons.Default.PhotoCamera, contentDescription = "عکس با دوربین", tint = MojCyan)
+                    }
+                    IconButton(onClick = onPickFile, enabled = isConnected) {
+                        Icon(Icons.Default.AttachFile, contentDescription = "ارسال فایل", tint = MojCyan)
+                    }
+                    IconButton(onClick = onToggleMyCamera, enabled = isConnected) {
+                        Icon(
+                            Icons.Default.Videocam,
+                            contentDescription = "دوربین زنده",
+                            tint = if (isSharingMyCamera) MojRedAlert else MojCyan
+                        )
+                    }
+                    OutlinedTextField(
+                        value = messageText,
+                        onValueChange = { messageText = it },
+                        placeholder = { Text("پیام متنی...", fontSize = 13.sp) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(
+                        onClick = {
+                            if (messageText.isNotBlank()) {
+                                onSendText(messageText.trim())
+                                messageText = ""
+                            }
+                        },
+                        enabled = isConnected && messageText.isNotBlank()
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "ارسال", tint = MojCyan)
+                    }
+                }
+            }
+        }
+    }
+
+    // دیالوگ اتصال دستی با کد، IP و پورت
+    if (showConnectDialog) {
+        var codeInput by remember { mutableStateOf("") }
+        var ipInput by remember { mutableStateOf(discoveredNetworks.firstOrNull()?.hostIp ?: "192.168.43.1") }
+        var portInput by remember { mutableStateOf("45455") }
+
+        AlertDialog(
+            onDismissRequest = { showConnectDialog = false },
+            title = { Text("اتصال به شبکه موج") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (discoveredNetworks.isNotEmpty()) {
+                        Text("شبکه‌های کشف‌شده در Wi-Fi:", fontSize = 12.sp, color = MojCyan)
+                        discoveredNetworks.forEach { net ->
+                            TextButton(onClick = {
+                                ipInput = net.hostIp
+                                portInput = net.tcpPort.toString()
+                            }) {
+                                Text("${net.networkName} (${net.hostIp})")
+                            }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = codeInput,
+                        onValueChange = { if (it.length <= 10) codeInput = it.uppercase() },
+                        label = { Text("کد اتصال (۸ کاراکتر)") },
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = ipInput,
+                        onValueChange = { ipInput = it },
+                        label = { Text("آدرس IP گوشی مرکزی") },
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = portInput,
+                        onValueChange = { portInput = it },
+                        label = { Text("پورت (پیش‌فرض 45455)") },
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    if (codeInput.isNotBlank() && ipInput.isNotBlank()) {
+                        onJoinNetwork(ipInput.trim(), portInput.toIntOrNull() ?: 45455, codeInput.trim())
+                        showConnectDialog = false
+                    }
+                }) { Text("اتصال") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showConnectDialog = false }) { Text("انصراف") }
+            }
+        )
+    }
+
+    // برگه مدیریت اعضا و درخواست‌های ورود
+    if (showMembersSheet) {
+        ModalBottomSheet(onDismissRequest = { showMembersSheet = false }) {
+            Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+                Text("اعضای شبکه (${members.size})", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text(
+                    text = if (staApSupported) "پشتیبانی هم‌زمان Wi-Fi + Hotspot: فعال" else "این گوشی هم‌زمانی Wi-Fi و Hotspot را پشتیبانی نمی‌کند",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                if (isHost && pendingJoinRequests.isNotEmpty()) {
+                    Text("درخواست‌های در انتظار تأیید:", color = MojCyan, fontSize = 13.sp)
+                    pendingJoinRequests.forEach { req ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(req.nickname)
+                            Row {
+                                TextButton(onClick = { onApproveMember(req.userId) }) { Text("تأیید", color = MojGreenOnline) }
+                                TextButton(onClick = { onRejectMember(req.userId) }) { Text("رد", color = MojRedAlert) }
+                            }
+                        }
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                }
+
+                members.forEach { member ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column {
+                            Text("${member.nickname} ${if (member.isHost) "(مدیر)" else ""}", fontWeight = FontWeight.Medium)
+                            Text(if (member.isOnline) "آنلاین" else "آفلاین", fontSize = 11.sp, color = MojGreenOnline)
+                        }
+                        Row {
+                            if (member.isSharingCamera) {
+                                TextButton(onClick = { onRequestWatchCamera(member.userId) }) {
+                                    Text("دیدن دوربین", color = MojCyan, fontSize = 12.sp)
+                                }
+                            }
+                            if (isHost && !member.isHost) {
+                                TextButton(onClick = { onKickMember(member.userId) }) {
+                                    Text("حذف", color = MojRedAlert, fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+        }
+    }
+}
