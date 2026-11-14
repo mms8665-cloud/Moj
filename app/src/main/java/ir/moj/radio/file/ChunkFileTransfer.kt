@@ -29,8 +29,8 @@ class ChunkFileTransfer(
     private val onSendChunkPayload: (ByteArray) -> Unit
 ) {
     companion object {
-        const val MAX_FILE_SIZE_BYTES: Long = 150L * 1024L * 1024L // 150 MB
-        const val CHUNK_SIZE_BYTES: Int = 64 * 1024 // 64 KB
+        const val MAX_FILE_SIZE_BYTES: Long = 150L * 1024L * 1024L
+        const val CHUNK_SIZE_BYTES: Int = 64 * 1024
     }
 
     private val activeJobs = ConcurrentHashMap<String, Job>()
@@ -87,7 +87,7 @@ class ChunkFileTransfer(
                                 localFilePath = file.absolutePath
                             )
                         )
-                        delay(8) // جلوگیری از اشباع بافر TCP در شبکه محلی
+                        delay(8)
                     }
                 }
             } catch (_: CancellationException) {
@@ -121,7 +121,6 @@ class ChunkFileTransfer(
             IncomingSession(File(dir, "${transferId.take(6)}_$fileName"), expectedSha256, totalChunks)
         }
 
-        // نوشتن مستقیم در آفست دقیق برای پشتیبانی از ادامه انتقال (Resume)
         RandomAccessFile(session.file, "rw").use { raf ->
             raf.seek(chunkIndex.toLong() * CHUNK_SIZE_BYTES)
             raf.write(data)
@@ -194,7 +193,9 @@ class ChunkFileTransfer(
     }
 
     private fun updateState(state: TransferState) {
-        _transfers.value = _transfers.value.toMutableMap().apply { put(state.transferId, state) }
+        val map = _transfers.value.toMutableMap()
+        map[state.transferId] = state
+        _transfers.value = map
     }
 
     private fun markCancelled(id: String) {
