@@ -39,7 +39,7 @@ class UdpDiscovery(private val context: Context) {
         broadcastJob = scope.launch(Dispatchers.IO) {
             val socket = DatagramSocket().apply { broadcast = true }
             try {
-                val message = "MOJ_HOST|$networkName\vert{}$tcpPort".toByteArray(Charsets.UTF_8)
+                val message = "MOJ_HOST#$networkName\vert{}$tcpPort".toByteArray(Charsets.UTF_8)
                 val broadcastAddr = InetAddress.getByName("255.255.255.255")
                 while (isActive) {
                     runCatching {
@@ -73,7 +73,7 @@ class UdpDiscovery(private val context: Context) {
                         val packet = DatagramPacket(buffer, buffer.size)
                         socket.receive(packet)
                         val text = String(packet.data, 0, packet.length, Charsets.UTF_8)
-                        val parts = text.split("|")
+                        val parts = text.split("#")
                         if (parts.size == 3 && parts[0] == "MOJ_HOST") {
                             val hostIp = packet.address.hostAddress ?: return@runCatching
                             val entry = DiscoveredNetwork(
