@@ -207,7 +207,7 @@ class MainActivity : ComponentActivity() {
                             staApSupported = udpDiscovery.isStaApConcurrencySupported(),
                             activeSpeaker = activeSpeaker,
                             isTransmitting = isTransmitting,
-                            isSharingMyCamera = isSharingMyCamera,
+                            isSharingMyCamera = isSharingCam,
                             messages = chatMessages,
                             transfers = transfersMap.values.toList(),
                             members = members,
