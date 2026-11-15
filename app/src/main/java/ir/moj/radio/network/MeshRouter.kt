@@ -1,129 +1,128 @@
 package ir.moj.radio.network
 
+import android.util.Log
 import ir.moj.radio.data.MeshPacket
 import ir.moj.radio.data.PacketType
 import ir.moj.radio.security.CryptoManager
 import kotlinx.coroutines.*
-import java.io.*
-import java.net.InetSocketAddress
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
-import javax.crypto.SecretKey
 
 class MeshRouter(
     private val cryptoManager: CryptoManager,
     private val memberManager: MemberManager,
     private val onPacketReceived: (MeshPacket, String) -> Unit
 ) {
-    private val tcpPort = 45455
+    private val activeConnections = ConcurrentHashMap<String, Socket>()
     private var serverSocket: ServerSocket? = null
-    private var secretKey: SecretKey? = null
-    private val peers = ConcurrentHashMap<String, PeerConnection>()
-    private val seenPacketIds = Collections.synchronizedSet(object : LinkedHashSet<String>() {
-        override fun add(element: String): Boolean {
-            if (size >= 2000) remove(iterator().next())
-            return super.add(element)
-        }
-    })
+    private var serverJob: Job? = null
+    private var networkKey: String = ""
 
-    private data class PeerConnection(
-        val ip: String,
-        val socket: Socket,
-        val output: DataOutputStream
-    )
-
-    fun setNetworkKey(joinCode: String) {
-        val salt = "MOJ_LOCAL_MESH_V1".toByteArray(Charsets.UTF_8)
-        secretKey = cryptoManager.deriveNetworkKey(joinCode, salt)
+    fun setNetworkKey(key: String) {
+        networkKey = key
     }
 
-    fun startServer(scope: CoroutineScope, port: Int = tcpPort) {
-        scope.launch(Dispatchers.IO) {
-            runCatching {
+    fun startServer(scope: CoroutineScope, port: Int = 45455) {
+        stopAll()
+        serverJob = scope.launch(Dispatchers.IO) {
+            try {
                 serverSocket = ServerSocket(port)
                 while (isActive) {
-                    val client = serverSocket?.accept() ?: break
-                    val peerIp = client.inetAddress.hostAddress ?: continue
-                    registerPeer(scope, peerIp, client)
+                    val socket = serverSocket?.accept() ?: break
+                    handleClientSocket(socket)
                 }
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun connectToPeer(scope: CoroutineScope, hostIp: Int, port: Int = 45455, onResult: (Boolean) -> Unit) {
+        connectToPeer(scope, hostIp.toString(), port, onResult)
+    }
+
+    fun connectToPeer(scope: CoroutineScope, hostIp: String, port: Int = 45455, onResult: (Boolean) -> Unit) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val socket = Socket(hostIp, port)
+                val peerIp = socket.inetAddress.hostAddress ?: hostIp
+                activeConnections[peerIp] = socket
+                handleClientSocket(socket, isServerSide = false)
+                onResult(true)
+            } catch (e: Exception) {
+                Log.e("MeshRouter", "Connect error: ${e.message}")
+                onResult(false)
             }
         }
     }
 
-    fun connectToPeer(scope: CoroutineScope, ip: String, port: Int = tcpPort, onResult: (Boolean) -> Unit) {
-        scope.launch(Dispatchers.IO) {
-            val ok = runCatching {
-                val socket = Socket()
-                socket.connect(InetSocketAddress(ip, port), 5000)
-                registerPeer(scope, ip, socket)
-                true
-            }.getOrDefault(false)
-            withContext(Dispatchers.Main) { onResult(ok) }
-        }
-    }
-
-    private fun registerPeer(scope: CoroutineScope, peerIp: String, socket: Socket) {
-        val outStream = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
-        val inStream = DataInputStream(BufferedInputStream(socket.getInputStream()))
-        peers[peerIp] = PeerConnection(peerIp, socket, outStream)
-
-        scope.launch(Dispatchers.IO) {
+    private fun handleClientSocket(socket: Socket, isServerSide: Boolean = true) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val peerIp = socket.inetAddress.hostAddress ?: "unknown"
+            if (isServerSide) {
+                activeConnections[peerIp] = socket
+            }
             try {
-                while (isActive && !socket.isClosed) {
-                    val length = inStream.readInt()
-                    if (length <= 0 || length > 2 * 1024 * 1024) break
-                    val encryptedBytes = ByteArray(length)
-                    inStream.readFully(encryptedBytes)
+                val input = DataInputStream(socket.getInputStream())
+                while (socket.isConnected && !socket.isClosed) {
+                    val encryptedLen = input.readInt()
+                    val encryptedBytes = ByteArray(encryptedLen)
+                    input.readFully(encryptedBytes)
 
-                    val key = secretKey ?: continue
-                    val rawBytes = runCatching { cryptoManager.decrypt(encryptedBytes, key) }.getOrNull() ?: continue
-                    val packet = deserializePacket(rawBytes) ?: continue
-
-                    if (!seenPacketIds.add(packet.packetId)) continue // جلوگیری از حلقه و تکرار
-
-                    val isJoinFlow = packet.type == PacketType.JOIN_REQUEST ||
-                            packet.type == PacketType.JOIN_APPROVED ||
-                            packet.type == PacketType.JOIN_REJECTED
-
-                    if (!isJoinFlow && !memberManager.isAuthorized(packet.senderId)) {
-                        continue // مسدود کردن عضو تأییدنشده یا حذف‌شده
-                    }
-
-                    onPacketReceived(packet, peerIp)
-
-                    // Relay به سایر گوشی‌های متصل در صورت باقی ماندن TTL
-                    if (packet.ttl > 1) {
-                        val relayed = packet.copy(ttl = packet.ttl - 1)
-                        broadcastPacket(relayed, excludeIp = peerIp)
+                    val decryptedJson = cryptoManager.decryptData(encryptedBytes, networkKey)
+                    if (decryptedJson != null) {
+                        val packet = MeshPacket.fromJson(decryptedJson)
+                        if (packet != null) {
+                            onPacketReceived(packet, peerIp)
+                            // اگر پکت عمومی است یا برای دوربین/ویس است، به دیگران هم رله کن
+                            if (packet.targetId == null || packet.type == PacketType.CAMERA_LIVE_FRAME) {
+                                relayPacketToOthers(packet, excludeIp = peerIp)
+                            }
+                        }
                     }
                 }
             } catch (_: Exception) {
             } finally {
-                peers.remove(peerIp)
+                activeConnections.remove(peerIp)
                 runCatching { socket.close() }
             }
         }
     }
 
-    fun broadcastPacket(packet: MeshPacket, excludeIp: String? = null) {
-        val key = secretKey ?: return
-        seenPacketIds.add(packet.packetId)
-        val raw = serializePacket(packet)
-        val encrypted = cryptoManager.encrypt(raw, key)
-
-        peers.values.forEach { peer ->
-            if (peer.ip != excludeIp) {
+    fun broadcastPacket(packet: MeshPacket) {
+        val json = packet.toJson()
+        val encrypted = cryptoManager.encryptData(json, networkKey) ?: return
+        
+        activeConnections.values.forEach { socket ->
+            CoroutineScope(Dispatchers.IO).launch {
                 runCatching {
-                    synchronized(peer.output) {
-                        peer.output.writeInt(encrypted.size)
-                        peer.output.write(encrypted)
-                        peer.output.flush()
+                    val output = DataOutputStream(socket.getOutputStream())
+                    synchronized(output) {
+                        output.writeInt(encrypted.size)
+                        output.write(encrypted)
+                        output.flush()
                     }
-                }.onFailure {
-                    peers.remove(peer.ip)
-                    runCatching { peer.socket.close() }
+                }
+            }
+        }
+    }
+
+    private fun relayPacketToOthers(packet: MeshPacket, excludeIp: String) {
+        val json = packet.toJson()
+        val encrypted = cryptoManager.encryptData(json, networkKey) ?: return
+
+        activeConnections.forEach { (ip, socket) ->
+            if (ip != excludeIp) {
+                CoroutineScope(Dispatchers.IO).launch {
+                    runCatching {
+                        val output = DataOutputStream(socket.getOutputStream())
+                        synchronized(output) {
+                            output.writeInt(encrypted.size)
+                            output.write(encrypted)
+                            output.flush()
+                        }
+                    }
                 }
             }
         }
@@ -131,42 +130,9 @@ class MeshRouter(
 
     fun stopAll() {
         runCatching { serverSocket?.close() }
-        peers.values.forEach { runCatching { it.socket.close() } }
-        peers.clear()
-        seenPacketIds.clear()
-    }
-
-    private fun serializePacket(packet: MeshPacket): ByteArray {
-        val bos = ByteArrayOutputStream()
-        DataOutputStream(bos).use { dos ->
-            dos.writeUTF(packet.packetId)
-            dos.writeByte(packet.type.code.toInt())
-            dos.writeUTF(packet.senderId)
-            dos.writeUTF(packet.senderNickname)
-            dos.writeUTF(packet.targetId ?: "")
-            dos.writeInt(packet.ttl)
-            dos.writeLong(packet.timestamp)
-            dos.writeInt(packet.payload.size)
-            dos.write(packet.payload)
-        }
-        return bos.toByteArray()
-    }
-
-    private fun deserializePacket(bytes: ByteArray): MeshPacket? {
-        return runCatching {
-            DataInputStream(ByteArrayInputStream(bytes)).use { dis ->
-                val id = dis.readUTF()
-                val type = PacketType.fromCode(dis.readByte()) ?: return null
-                val senderId = dis.readUTF()
-                val senderNick = dis.readUTF()
-                val target = dis.readUTF().ifEmpty { null }
-                val ttl = dis.readInt()
-                val ts = dis.readLong()
-                val payloadSize = dis.readInt()
-                val payload = ByteArray(payloadSize)
-                dis.readFully(payload)
-                MeshPacket(id, type, senderId, senderNick, target, ttl, ts, payload)
-            }
-        }.getOrNull()
+        serverSocket = null
+        serverJob?.cancel()
+        activeConnections.values.forEach { runCatching { it.close() } }
+        activeConnections.clear()
     }
 }
