@@ -367,7 +367,7 @@ class MainActivity : ComponentActivity() {
         permissionLauncher.launch(perms.toTypedArray())
     }
 
-    override onDestroy() {
+    override fun onDestroy() {
         super.onDestroy()
         pttEngine.release()
         cameraEngine.release()
