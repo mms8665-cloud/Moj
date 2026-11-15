@@ -10,8 +10,8 @@ android {
 
     defaultConfig {
         applicationId = "ir.moj.radio"
-        minSdk = 26 // Android 8.0
-        targetSdk = 35 // Compatible through Android 15/16
+        minSdk = 26
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
     }
@@ -51,12 +51,12 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 
-    // CameraX for Photo & Local Live Camera
     val cameraxVersion = "1.4.0"
     implementation("androidx.camera:camera-core:$cameraxVersion")
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 }
