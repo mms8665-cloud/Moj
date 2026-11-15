@@ -35,9 +35,8 @@ class LocalCameraEngine(
     private var lensFacing: Int = CameraSelector.LENS_FACING_BACK
     private var lastFrameSentTimeMs: Long = 0L
 
-    @Volatile var currentQuality: CameraQuality = CameraQuality.MEDIUM
+    var currentQuality: CameraQuality = CameraQuality.MEDIUM
 
-    // فقط کاربرانی که صاحب گوشی صریحاً اجازه مشاهده به آن‌ها داده است
     private val approvedViewers = ConcurrentHashMap.newKeySet<String>()
 
     private val _isSharingMyCamera = MutableStateFlow(false)
@@ -46,7 +45,6 @@ class LocalCameraEngine(
     private val _pendingViewRequests = MutableStateFlow<List<CameraViewRequest>>(emptyList())
     val pendingViewRequests: StateFlow<List<CameraViewRequest>> = _pendingViewRequests
 
-    // پشتیبانی از مشاهده هم‌زمان چند دوربین زنده از اعضای مختلف
     private val _remoteStreams = MutableStateFlow>(emptyMap())
     val remoteStreams: StateFlow> = _remoteStreams
 
@@ -122,6 +120,7 @@ class LocalCameraEngine(
                 val now = System.currentTimeMillis()
                 val minIntervalMs = 1000L / quality.targetFps
                 if (now - lastFrameSentTimeMs >= minIntervalMs && approvedViewers.isNotEmpty()) {
+                    lastFileSentTimeMs(now)
                     lastFrameSentTimeMs = now
                     val jpeg = imageProxyToJpeg(imageProxy, quality.jpegQuality)
                     if (jpeg != null) {
@@ -135,6 +134,10 @@ class LocalCameraEngine(
 
         val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
         provider.bindToLifecycle(lifecycleOwner, selector, analysis)
+    }
+
+    private fun lastFileSentTimeMs(time: Long) {
+        lastFrameSentTimeMs = time
     }
 
     private fun imageProxyToJpeg(image: ImageProxy, quality: Int): ByteArray? {
