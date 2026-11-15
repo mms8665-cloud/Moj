@@ -24,6 +24,8 @@ data class TransferState(
         get() = if (totalBytes > 0) ((transferredBytes * 100) / totalBytes).toInt().coerceIn(0, 100) else 0
 }
 
+typealias TransferMap = Map<String, TransferState>
+
 class ChunkFileTransfer(
     private val context: Context,
     private val onSendChunkPayload: (ByteArray) -> Unit
@@ -36,12 +38,8 @@ class ChunkFileTransfer(
     private val activeJobs = ConcurrentHashMap<String, Job>()
     private val incomingFiles = ConcurrentHashMap<String, IncomingSession>()
 
-    typealias TransferMap = Map<String, TransferState>
-
-class ChunkFileTransfer(
-    private val context: Context,
-
-
+    private val _transfers = MutableStateFlow<TransferMap>(emptyMap())
+    val transfers: StateFlow<TransferMap> = _transfers
 
     private data class IncomingSession(
         val file: File,
