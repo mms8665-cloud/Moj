@@ -25,6 +25,8 @@ data class RemoteCameraStream(
     val latestFrame: Bitmap
 )
 
+typealias RemoteStreamMap = Map<String, RemoteCameraStream>
+
 class LocalCameraEngine(
     private val context: Context,
     private val onEncodedFrameReady: (targetUserIds: Set<String>, jpegBytes: ByteArray) -> Unit,
@@ -45,12 +47,8 @@ class LocalCameraEngine(
     private val _pendingViewRequests = MutableStateFlow<List<CameraViewRequest>>(emptyList())
     val pendingViewRequests: StateFlow<List<CameraViewRequest>> = _pendingViewRequests
 
-    typealias RemoteStreamMap = Map<String, RemoteCameraStream>
-
-class LocalCameraEngine(
-    private val context: Context,
-
-
+    private val _remoteStreams = MutableStateFlow<RemoteStreamMap>(emptyMap())
+    val remoteStreams: StateFlow<RemoteStreamMap> = _remoteStreams
 
     fun onIncomingViewRequest(requesterId: String, requesterNickname: String) {
         val current = _pendingViewRequests.value
@@ -124,7 +122,6 @@ class LocalCameraEngine(
                 val now = System.currentTimeMillis()
                 val minIntervalMs = 1000L / quality.targetFps
                 if (now - lastFrameSentTimeMs >= minIntervalMs && approvedViewers.isNotEmpty()) {
-                    lastFileSentTimeMs(now)
                     lastFrameSentTimeMs = now
                     val jpeg = imageProxyToJpeg(imageProxy, quality.jpegQuality)
                     if (jpeg != null) {
@@ -138,10 +135,6 @@ class LocalCameraEngine(
 
         val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
         provider.bindToLifecycle(lifecycleOwner, selector, analysis)
-    }
-
-    private fun lastFileSentTimeMs(time: Long) {
-        lastFrameSentTimeMs = time
     }
 
     private fun imageProxyToJpeg(image: ImageProxy, quality: Int): ByteArray? {
