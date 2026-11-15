@@ -1,6 +1,7 @@
 package ir.moj.radio
 
 import android.Manifest
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +18,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
+import com.google.zxing.BarcodeFormat
+import com.journeyapps.barcodescanner.BarcodeEncoder
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import ir.moj.radio.audio.PttAudioEngine
 import ir.moj.radio.camera.LocalCameraEngine
 import ir.moj.radio.data.*
@@ -55,11 +60,25 @@ class MainActivity : ComponentActivity() {
     private var isHost by mutableStateOf(false)
     private var activeNetworkName by mutableStateOf("شبکه محلی موج")
     private var activeJoinCode by mutableStateOf<String?>(null)
+    private var qrBitmap by mutableStateOf<Bitmap?>(null)
     private val chatMessages = mutableStateListOf<ChatItem>()
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { }
+
+    private val qrScanLauncher = registerForActivityResult(ScanContract()) { result ->
+        val contents = result.contents ?: return@registerForActivityResult
+        val parts = contents.split("#")
+        if (parts.size == 4 && parts[0] == "MOJ") {
+            val hostIp = parts[1]
+            val port = parts[2].toIntOrNull() ?: 45455
+            val code = parts[3]
+            joinLocalNetwork(hostIp, port, code)
+        } else {
+            Toast.makeText(this, "QR کد نامعتبر است!", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     private val galleryLauncher = registerForActivityResult(
         ActivityResultContracts.GetContent()
@@ -74,7 +93,7 @@ class MainActivity : ComponentActivity() {
     ) { bitmap ->
         if (bitmap != null) {
             val file = File(cacheDir, "cam_${System.currentTimeMillis()}.jpg")
-            FileOutputStream(file).use { bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, it) }
+            FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.JPEG, 85, it) }
             fileTransfer.sendFile(lifecycleScope, file)
         }
     }
@@ -146,6 +165,7 @@ class MainActivity : ComponentActivity() {
                             myNickname = currentSettings.nickname,
                             networkName = activeNetworkName,
                             joinCode = activeJoinCode,
+                            qrBitmap = qrBitmap,
                             isHost = isHost,
                             isConnected = isConnected,
                             staApSupported = udpDiscovery.isStaApConcurrencySupported(),
@@ -161,6 +181,7 @@ class MainActivity : ComponentActivity() {
                             discoveredNetworks = discovered,
                             onCreateNetwork = { createLocalNetwork() },
                             onJoinNetwork = { ip, port, code -> joinLocalNetwork(ip, port, code) },
+                            onScanQrCode = { launchQrScanner() },
                             onApproveMember = { id -> approveMember(id) },
                             onRejectMember = { id -> rejectMember(id) },
                             onKickMember = { id -> kickMember(id) },
@@ -187,6 +208,22 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun launchQrScanner() {
+        val options = ScanOptions().apply {
+            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+            setPrompt("دوربین را روی QR کد گوشی مرکزی بگیرید")
+            setBeepEnabled(true)
+            setOrientationLocked(false)
+        }
+        qrScanLauncher.launch(options)
+    }
+
+    private fun generateQrBitmap(content: String): Bitmap? {
+        return runCatching {
+            BarcodeEncoder().encodeBitmap(content, BarcodeFormat.QR_CODE, 600, 600)
+        }.getOrNull()
     }
 
     private fun initEngines() {
@@ -224,10 +261,19 @@ class MainActivity : ComponentActivity() {
 
     private fun getLocalIpAddress(): String {
         return try {
-            NetworkInterface.getNetworkInterfaces().toList()
-                .flatMap { it.inetAddresses.toList() }
-                .firstOrNull { !it.isLoopbackAddress && it is Inet4Address }
-                ?.hostAddress ?: "192.168.43.1"
+            val interfaces = NetworkInterface.getNetworkInterfaces().toList()
+            val candidates = interfaces.filter { it.isUp && !it.isLoopback }.flatMap { iface ->
+                iface.inetAddresses.toList()
+                    .filterIsInstance<Inet4Address>()
+                    .map { iface.name.lowercase() to (it.hostAddress ?: "") }
+            }
+            // اولویت با هات‌اسپات و وای‌فای محلی (192.168.x.x) نه اینترنت سیم‌کارت
+            candidates.firstOrNull { (name, ip) ->
+                (name.contains("ap") || name.contains("wlan") || name.contains("swlan")) && ip.startsWith("192.168.")
+            }?.second
+                ?: candidates.firstOrNull { (_, ip) -> ip.startsWith("192.168.") }?.second
+                ?: candidates.firstOrNull { (_, ip) -> ip.startsWith("10.") || ip.startsWith("172.") }?.second
+                ?: "192.168.43.1"
         } catch (_: Exception) {
             "192.168.43.1"
         }
@@ -240,6 +286,7 @@ class MainActivity : ComponentActivity() {
         activeNetworkName = "موج ($myIp)"
         isHost = true
         isConnected = true
+        qrBitmap = generateQrBitmap("MOJ#$myIp#45455#$code")
 
         meshRouter.setNetworkKey(code)
         meshRouter.startServer(lifecycleScope)
@@ -247,21 +294,21 @@ class MainActivity : ComponentActivity() {
         udpDiscovery.startBroadcasting(lifecycleScope, activeNetworkName)
         pttEngine.initializePlayback()
         runCatching { MojForegroundService.start(this, "مدیر شبکه: $myIp (کد: $code)") }
-        Toast.makeText(this, "شبکه ساخته شد | IP: $myIp | کد: $code", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "شبکه ساخته شد! آیکن QR بالا را بزنید", Toast.LENGTH_LONG).show()
     }
 
     private fun joinLocalNetwork(hostIp: String, port: Int, code: String) {
         activeJoinCode = code
         isHost = false
         meshRouter.setNetworkKey(code)
-        Toast.makeText(this, "در حال اتصال به $hostIp:$port ...", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "در حال اتصال به $hostIp ...", Toast.LENGTH_SHORT).show()
         meshRouter.connectToPeer(lifecycleScope, hostIp, port) { ok ->
             if (ok) {
                 sendPacket(PacketType.JOIN_REQUEST, currentSettings.nickname.toByteArray())
                 Toast.makeText(this, "درخواست ارسال شد؛ مدیر باید در بخش اعضا تأیید کند", Toast.LENGTH_LONG).show()
                 runCatching { MojForegroundService.start(this, "در انتظار تأیید مدیر شبکه...") }
             } else {
-                Toast.makeText(this, "اتصال برقرار نشد! IP گوشی مرکزی و اتصال Wi-Fi را چک کنید", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "اتصال برقرار نشد! ابتدا به هات‌اسپات گوشی اول وصل شوید", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -373,6 +420,7 @@ class MainActivity : ComponentActivity() {
         isConnected = false
         isHost = false
         activeJoinCode = null
+        qrBitmap = null
         udpDiscovery.stopBroadcasting()
         meshRouter.stopAll()
         cameraEngine.stopSharing()
