@@ -1,7 +1,6 @@
 package ir.moj.radio.ui.screens
 
 import android.content.ContentValues
-import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
@@ -45,6 +44,8 @@ import ir.moj.radio.ui.theme.*
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.*
 
 data class ChatItem(
     val id: String,
@@ -80,6 +81,9 @@ fun MainRadioScreen(
     onJoinNetwork: (hostIp: String, port: Int, code: String) -> Unit,
     onScanQrCode: () -> Unit,
     onOpenWifiPanel: () -> Unit,
+    onStartVoiceRecord: () -> Unit,
+    onStopVoiceRecord: () -> Unit,
+    onPlayVoice: (File) -> Unit,
     onApproveMember: (String) -> Unit,
     onRejectMember: (String) -> Unit,
     onKickMember: (String) -> Unit,
@@ -105,6 +109,7 @@ fun MainRadioScreen(
     var showQrDialog by remember { mutableStateOf(false) }
     var showMembersSheet by remember { mutableStateOf(false) }
     var fullScreenImagePath by remember { mutableStateOf<String?>(null) }
+    var isRecordingVoice by remember { mutableStateOf(false) }
 
     Scaffold(
         modifier = Modifier
@@ -333,6 +338,9 @@ fun MainRadioScreen(
                         val lower = transfer.fileName.lowercase()
                         lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp")
                     }
+                    val isVoiceFile = remember(transfer.fileName) {
+                        transfer.fileName.lowercase().endsWith(".3gp") || transfer.fileName.lowercase().endsWith(".mp3")
+                    }
                     val previewBitmap = remember(transfer.localFilePath, transfer.isCompleted) {
                         if (isImageFile && transfer.localFilePath != null && (transfer.isCompleted || transfer.isOutgoing)) {
                             runCatching { BitmapFactory.decodeFile(transfer.localFilePath) }.getOrNull()
@@ -355,6 +363,42 @@ fun MainRadioScreen(
                                     fontWeight = FontWeight.SemiBold,
                                     modifier = Modifier.weight(1f)
                                 )
+                                if (transfer.isCompleted && transfer.localFilePath != null) {
+                                    IconButton(
+                                        onClick = {
+                                            val srcFile = File(transfer.localFilePath)
+                                            if (srcFile.exists()) {
+                                                runCatching {
+                                                    val savedName = "MOJ_${System.currentTimeMillis()}_${transfer.fileName}"
+                                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                                        val values = ContentValues().apply {
+                                                            put(MediaStore.MediaColumns.DISPLAY_NAME, savedName)
+                                                            put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/MojRadio")
+                                                        }
+                                                        val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                                                        if (uri != null) {
+                                                            context.contentResolver.openOutputStream(uri)?.use { out ->
+                                                                FileInputStream(srcFile).use { it.copyTo(out) }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        val dir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+                                                        val dest = File(dir, savedName)
+                                                        FileInputStream(srcFile).use { input ->
+                                                            FileOutputStream(dest).use { output -> input.copyTo(output) }
+                                                        }
+                                                    }
+                                                    Toast.makeText(context, "در پوشه Download ذخیره شد", Toast.LENGTH_SHORT).show()
+                                                }.onFailure {
+                                                    Toast.makeText(context, "خطا در ذخیره فایل", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(Icons.Default.Download, contentDescription = "دانلود", tint = MojCyan)
+                                    }
+                                }
                                 if (!transfer.isCompleted && !transfer.isCancelled && !transfer.isFailed) {
                                     TextButton(onClick = { onCancelTransfer(transfer.transferId) }) {
                                         Text("لغو", color = MojRedAlert, fontSize = 12.sp)
@@ -375,6 +419,16 @@ fun MainRadioScreen(
                                         .clickable { fullScreenImagePath = transfer.localFilePath }
                                 )
                                 Spacer(modifier = Modifier.height(6.dp))
+                            } else if (isVoiceFile && transfer.localFilePath != null && transfer.isCompleted) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Button(
+                                    onClick = { onPlayVoice(File(transfer.localFilePath)) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = MojElectricBlue)
+                                ) {
+                                    Icon(Icons.Default.PlayArrow, contentDescription = null)
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("پخش ویس")
+                                }
                             }
 
                             LinearProgressIndicator(
@@ -382,9 +436,9 @@ fun MainRadioScreen(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                             )
                             val statusLabel = when {
-                                transfer.isCompleted -> "تکمیل و تأیید شد (۱۰۰٪)"
+                                transfer.isCompleted -> "تکمیل (نمایش آنلاین - بدون ذخیره در حافظه)"
                                 transfer.isCancelled -> "لغو شد"
-                                transfer.isFailed -> "خطا در انتقال یا صحت فایل"
+                                transfer.isFailed -> "خطا در انتقال فایل"
                                 else -> "${transfer.progressPercent}٪"
                             }
                             Text(statusLabel, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -477,7 +531,8 @@ fun MainRadioScreen(
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     IconButton(onClick = onPickGalleryImage, enabled = isConnected) {
                         Icon(Icons.Default.Photo, contentDescription = "گالری", tint = MojCyan)
@@ -495,6 +550,38 @@ fun MainRadioScreen(
                             tint = if (isSharingMyCamera) MojRedAlert else MojCyan
                         )
                     }
+
+                    // دکمه ضبط ویس (فشار دهید و نگه دارید)
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(if (isRecordingVoice) MojRedAlert else MojCyan)
+                            .pointerInput(isConnected) {
+                                detectTapGestures(
+                                    onPress = {
+                                        if (isConnected) {
+                                            isRecordingVoice = true
+                                            onStartVoiceRecord()
+                                            tryAwaitRelease()
+                                            isRecordingVoice = false
+                                            onStopVoiceRecord()
+                                        }
+                                    }
+                                )
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Default.KeyboardVoice, contentDescription = "ویس", tint = Color.White)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     OutlinedTextField(
                         value = messageText,
                         onValueChange = { messageText = it },
