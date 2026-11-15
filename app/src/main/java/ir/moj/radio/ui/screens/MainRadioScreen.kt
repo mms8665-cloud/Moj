@@ -1,5 +1,6 @@
 package ir.moj.radio.ui.screens
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -46,6 +47,7 @@ fun MainRadioScreen(
     myNickname: String,
     networkName: String,
     joinCode: String?,
+    qrBitmap: Bitmap?,
     isHost: Boolean,
     isConnected: Boolean,
     staApSupported: Boolean,
@@ -61,6 +63,7 @@ fun MainRadioScreen(
     discoveredNetworks: List<DiscoveredNetwork>,
     onCreateNetwork: () -> Unit,
     onJoinNetwork: (hostIp: String, port: Int, code: String) -> Unit,
+    onScanQrCode: () -> Unit,
     onApproveMember: (String) -> Unit,
     onRejectMember: (String) -> Unit,
     onKickMember: (String) -> Unit,
@@ -82,6 +85,7 @@ fun MainRadioScreen(
 ) {
     var messageText by remember { mutableStateOf("") }
     var showConnectDialog by remember { mutableStateOf(false) }
+    var showQrDialog by remember { mutableStateOf(false) }
     var showMembersSheet by remember { mutableStateOf(false) }
 
     Scaffold(
@@ -96,14 +100,14 @@ fun MainRadioScreen(
                     Column {
                         Text(
                             text = if (isConnected) networkName else "موج (متصل نیست)",
-                            fontSize = 16.sp,
+                            fontSize = 15.sp,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
                             text = if (isConnected) {
-                                "کد شبکه: ${joinCode ?: "-"} | اعضا: ${members.size}"
+                                "کد: ${joinCode ?: "-"} | اعضا: ${members.size}"
                             } else {
-                                "برای شروع، شبکه بسازید یا متصل شوید"
+                                "شبکه بسازید یا QR کد را اسکن کنید"
                             },
                             fontSize = 11.sp,
                             color = if (isConnected) MojGreenOnline else MaterialTheme.colorScheme.onSurfaceVariant
@@ -111,6 +115,11 @@ fun MainRadioScreen(
                     }
                 },
                 actions = {
+                    if (isHost && qrBitmap != null) {
+                        IconButton(onClick = { showQrDialog = true }) {
+                            Icon(Icons.Default.QrCode, contentDescription = "نمایش QR کد", tint = MojCyan)
+                        }
+                    }
                     IconButton(onClick = { showMembersSheet = true }) {
                         BadgedBox(
                             badge = {
@@ -139,12 +148,11 @@ fun MainRadioScreen(
                 .navigationBarsPadding()
                 .imePadding()
         ) {
-            // نوار وضعیت کاربر و دکمه‌های اتصال سریع
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(MojNavyCard)
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -155,9 +163,9 @@ fun MainRadioScreen(
                             .clip(CircleShape)
                             .background(if (isConnected) MojGreenOnline else Color.Gray)
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "$myNickname ${if (isHost) "(مدیر شبکه)" else ""}",
+                        text = "$myNickname ${if (isHost) "(مدیر)" else ""}",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium
                     )
@@ -167,15 +175,23 @@ fun MainRadioScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         FilledTonalButton(
                             onClick = onCreateNetwork,
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                         ) {
-                            Text("ایجاد شبکه", fontSize = 12.sp)
+                            Text("ایجاد شبکه", fontSize = 11.sp)
+                        }
+                        FilledTonalButton(
+                            onClick = onScanQrCode,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Icon(Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("اسکن QR", fontSize = 11.sp)
                         }
                         OutlinedButton(
                             onClick = { showConnectDialog = true },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                         ) {
-                            Text("اتصال با کد", fontSize = 12.sp)
+                            Text("دستی", fontSize = 11.sp)
                         }
                     }
                 } else if (isSharingMyCamera) {
@@ -188,7 +204,6 @@ fun MainRadioScreen(
                 }
             }
 
-            // نمایش درخواست‌های مشاهده دوربین زنده (حریم خصوصی)
             pendingCameraRequests.forEach { req ->
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MojNavyCard),
@@ -208,7 +223,6 @@ fun MainRadioScreen(
                 }
             }
 
-            // نمایش هم‌زمان دوربین‌های زنده دریافتی
             if (remoteCameras.isNotEmpty()) {
                 LazyRow(
                     modifier = Modifier
@@ -251,7 +265,6 @@ fun MainRadioScreen(
                 }
             }
 
-            // بخش مرکزی: تاریخچه پیام‌ها و وضعیت انتقال فایل‌ها
             LazyColumn(
                 modifier = Modifier
                     .weight(1f)
@@ -331,7 +344,6 @@ fun MainRadioScreen(
                 }
             }
 
-            // نوار وضعیت گوینده بی‌سیم و دکمه بزرگ Push To Talk
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -369,11 +381,7 @@ fun MainRadioScreen(
                         }
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.Mic,
-                            contentDescription = "بی‌سیم",
-                            tint = Color.White
-                        )
+                        Icon(imageVector = Icons.Default.Mic, contentDescription = "بی‌سیم", tint = Color.White)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = if (isTransmitting) "در حال ارسال صدا... (رها کنید)" else "نگه دارید و صحبت کنید (PTT)",
@@ -386,7 +394,6 @@ fun MainRadioScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // کادر ارسال پیام و دکمه‌های رسانه
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -430,7 +437,32 @@ fun MainRadioScreen(
         }
     }
 
-    // دیالوگ اتصال دستی با کد، IP و پورت
+    if (showQrDialog && qrBitmap != null) {
+        AlertDialog(
+            onDismissRequest = { showQrDialog = false },
+            title = { Text("QR کد اتصال به شبکه") },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                    Image(
+                        bitmap = qrBitmap.asImageBitmap(),
+                        contentDescription = "QR Code",
+                        modifier = Modifier
+                            .size(230.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.White)
+                            .padding(8.dp)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("شبکه: $networkName", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    Text("کد اتصال: ${joinCode ?: "-"}", fontSize = 13.sp, color = MojCyan)
+                }
+            },
+            confirmButton = {
+                Button(onClick = { showQrDialog = false }) { Text("بستن") }
+            }
+        )
+    }
+
     if (showConnectDialog) {
         var codeInput by remember { mutableStateOf("") }
         var ipInput by remember { mutableStateOf(discoveredNetworks.firstOrNull()?.hostIp ?: "192.168.43.1") }
@@ -438,11 +470,11 @@ fun MainRadioScreen(
 
         AlertDialog(
             onDismissRequest = { showConnectDialog = false },
-            title = { Text("اتصال به شبکه موج") },
+            title = { Text("اتصال دستی به شبکه موج") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (discoveredNetworks.isNotEmpty()) {
-                        Text("شبکه‌های کشف‌شده در Wi-Fi:", fontSize = 12.sp, color = MojCyan)
+                        Text("شبکه‌های کشف‌شده:", fontSize = 12.sp, color = MojCyan)
                         discoveredNetworks.forEach { net ->
                             TextButton(onClick = {
                                 ipInput = net.hostIp
@@ -486,7 +518,6 @@ fun MainRadioScreen(
         )
     }
 
-    // برگه مدیریت اعضا و درخواست‌های ورود
     if (showMembersSheet) {
         ModalBottomSheet(onDismissRequest = { showMembersSheet = false }) {
             Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
