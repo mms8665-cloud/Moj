@@ -3,9 +3,12 @@ package ir.moj.radio.ui.screens
 import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.widget.MediaController
 import android.widget.Toast
+import android.widget.VideoView
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -31,11 +34,13 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import ir.moj.radio.camera.CameraViewRequest
+import androidx.compose.ui.viewinterop.AndroidView
 import ir.moj.radio.camera.RemoteCameraStream
 import ir.moj.radio.data.NetworkMember
 import ir.moj.radio.file.TransferState
@@ -44,8 +49,6 @@ import ir.moj.radio.ui.theme.*
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.text.SimpleDateFormat
-import java.util.*
 
 data class ChatItem(
     val id: String,
@@ -67,6 +70,10 @@ fun MainRadioScreen(
     isHost: Boolean,
     isConnected: Boolean,
     staApSupported: Boolean,
+    isFullAccessAllowed: Boolean,
+    isActivated: Boolean,
+    remainingTrialHours: Long,
+    deviceCode: String,
     activeSpeaker: String?,
     isTransmitting: Boolean,
     isSharingMyCamera: Boolean,
@@ -74,16 +81,17 @@ fun MainRadioScreen(
     transfers: List<TransferState>,
     members: List<NetworkMember>,
     pendingJoinRequests: List<NetworkMember>,
-    pendingCameraRequests: List<CameraViewRequest>,
     remoteCameras: List<RemoteCameraStream>,
     discoveredNetworks: List<DiscoveredNetwork>,
+    onActivateApp: (String) -> Boolean,
     onCreateNetwork: () -> Unit,
     onJoinNetwork: (hostIp: String, port: Int, code: String) -> Unit,
     onScanQrCode: () -> Unit,
     onOpenWifiPanel: () -> Unit,
     onStartVoiceRecord: () -> Unit,
     onStopVoiceRecord: () -> Unit,
-    onPlayVoice: (File) -> Unit,
+    onPlayAudio: (File) -> Unit,
+    onStopAudio: () -> Unit,
     onApproveMember: (String) -> Unit,
     onRejectMember: (String) -> Unit,
     onKickMember: (String) -> Unit,
@@ -96,20 +104,24 @@ fun MainRadioScreen(
     onCancelTransfer: (String) -> Unit,
     onToggleMyCamera: () -> Unit,
     onSwitchMyCamera: () -> Unit,
-    onRequestWatchCamera: (String) -> Unit,
-    onApproveCameraViewer: (String) -> Unit,
-    onRejectCameraViewer: (String) -> Unit,
     onStopWatchingCamera: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onOpenGuide: () -> Unit
 ) {
     val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     var messageText by remember { mutableStateOf("") }
     var showConnectDialog by remember { mutableStateOf(false) }
     var showQrDialog by remember { mutableStateOf(false) }
     var showMembersSheet by remember { mutableStateOf(false) }
+    var showActivationDialog by remember { mutableStateOf(false) }
     var fullScreenImagePath by remember { mutableStateOf<String?>(null) }
+    var fullScreenVideoPath by remember { mutableStateOf<String?>(null) }
     var isRecordingVoice by remember { mutableStateOf(false) }
+
+    fun requireFullAccess(action: () -> Unit) {
+        if (isFullAccessAllowed) action() else showActivationDialog = true
+    }
 
     Scaffold(
         modifier = Modifier
@@ -138,6 +150,15 @@ fun MainRadioScreen(
                     }
                 },
                 actions = {
+                    if (!isActivated) {
+                        IconButton(onClick = { showActivationDialog = true }) {
+                            Icon(
+                                imageVector = if (isFullAccessAllowed) Icons.Default.Key else Icons.Default.Lock,
+                                contentDescription = "فعال‌سازی",
+                                tint = if (isFullAccessAllowed) MojCyan else MojRedAlert
+                            )
+                        }
+                    }
                     IconButton(onClick = onOpenWifiPanel) {
                         Icon(Icons.Default.Wifi, contentDescription = "پنل وای‌فای", tint = MojCyan)
                     }
@@ -174,6 +195,28 @@ fun MainRadioScreen(
                 .navigationBarsPadding()
                 .imePadding()
         ) {
+            if (!isActivated) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(if (isFullAccessAllowed) Color(0xFF10304B) else Color(0xFF4A141C))
+                        .clickable { showActivationDialog = true }
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (isFullAccessAllowed) {
+                            "نسخه تست رایگان (باقی‌مانده: $remainingTrialHours ساعت) - لمس برای فعال‌سازی"
+                        } else {
+                            "مهلت تست تمام شد (فقط واکی‌تاکی فعال است) - لمس برای فعال‌سازی"
+                        },
+                        fontSize = 11.sp,
+                        color = Color.White
+                    )
+                }
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -230,30 +273,11 @@ fun MainRadioScreen(
                 }
             }
 
-            pendingCameraRequests.forEach { req ->
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = MojNavyCard),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text("${req.requesterNickname} درخواست دیدن دوربین شما را دارد", fontSize = 12.sp, modifier = Modifier.weight(1f))
-                        TextButton(onClick = { onApproveCameraViewer(req.requesterId) }) { Text("اجازه", color = MojGreenOnline) }
-                        TextButton(onClick = { onRejectCameraViewer(req.requesterId) }) { Text("رد", color = MojRedAlert) }
-                    }
-                }
-            }
-
             if (localCameraFrame != null || remoteCameras.isNotEmpty()) {
                 LazyRow(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(170.dp)
+                        .height(175.dp)
                         .padding(horizontal = 8.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -334,13 +358,11 @@ fun MainRadioScreen(
                 contentPadding = PaddingValues(vertical = 8.dp)
             ) {
                 items(transfers, key = { it.transferId }) { transfer ->
-                    val isImageFile = remember(transfer.fileName) {
-                        val lower = transfer.fileName.lowercase()
-                        lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp")
-                    }
-                    val isVoiceFile = remember(transfer.fileName) {
-                        transfer.fileName.lowercase().endsWith(".3gp") || transfer.fileName.lowercase().endsWith(".mp3")
-                    }
+                    val lower = remember(transfer.fileName) { transfer.fileName.lowercase() }
+                    val isImageFile = lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp")
+                    val isVideoFile = lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".webm") || lower.endsWith(".mov")
+                    val isAudioFile = lower.endsWith(".3gp") || lower.endsWith(".mp3") || lower.endsWith(".wav") || lower.endsWith(".m4a") || lower.endsWith(".aac") || lower.endsWith(".ogg")
+
                     val previewBitmap = remember(transfer.localFilePath, transfer.isCompleted) {
                         if (isImageFile && transfer.localFilePath != null && (transfer.isCompleted || transfer.isOutgoing)) {
                             runCatching { BitmapFactory.decodeFile(transfer.localFilePath) }.getOrNull()
@@ -419,15 +441,32 @@ fun MainRadioScreen(
                                         .clickable { fullScreenImagePath = transfer.localFilePath }
                                 )
                                 Spacer(modifier = Modifier.height(6.dp))
-                            } else if (isVoiceFile && transfer.localFilePath != null && transfer.isCompleted) {
+                            } else if (isVideoFile && transfer.localFilePath != null && (transfer.isCompleted || transfer.isOutgoing)) {
                                 Spacer(modifier = Modifier.height(6.dp))
                                 Button(
-                                    onClick = { onPlayVoice(File(transfer.localFilePath)) },
+                                    onClick = { fullScreenVideoPath = transfer.localFilePath },
                                     colors = ButtonDefaults.buttonColors(containerColor = MojElectricBlue)
                                 ) {
-                                    Icon(Icons.Default.PlayArrow, contentDescription = null)
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("پخش ویس")
+                                    Icon(Icons.Default.PlayCircle, contentDescription = null)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("پخش ویدئو داخل برنامه")
+                                }
+                            } else if (isAudioFile && transfer.localFilePath != null && (transfer.isCompleted || transfer.isOutgoing)) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        onClick = { onPlayAudio(File(transfer.localFilePath)) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = MojElectricBlue)
+                                    ) {
+                                        Icon(Icons.Default.PlayArrow, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("پخش صوت")
+                                    }
+                                    OutlinedButton(onClick = onStopAudio) {
+                                        Icon(Icons.Default.Stop, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("توقف")
+                                    }
                                 }
                             }
 
@@ -436,7 +475,7 @@ fun MainRadioScreen(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
                             )
                             val statusLabel = when {
-                                transfer.isCompleted -> "تکمیل (نمایش آنلاین - بدون ذخیره در حافظه)"
+                                transfer.isCompleted -> "تکمیل (نمایش در اپ - برای ذخیره دکمه دانلود را بزنید)"
                                 transfer.isCancelled -> "لغو شد"
                                 transfer.isFailed -> "خطا در انتقال فایل"
                                 else -> "${transfer.progressPercent}٪"
@@ -496,6 +535,7 @@ fun MainRadioScreen(
                     Spacer(modifier = Modifier.height(4.dp))
                 }
 
+                // واکی‌تاکی همیشه باز است (حتی بعد از اتمام تست ۲ روزه)
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
@@ -534,38 +574,51 @@ fun MainRadioScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    IconButton(onClick = onPickGalleryImage, enabled = isConnected) {
-                        Icon(Icons.Default.Photo, contentDescription = "گالری", tint = MojCyan)
+                    IconButton(onClick = { requireFullAccess(onPickGalleryImage) }, enabled = isConnected) {
+                        Icon(Icons.Default.Photo, contentDescription = "گالری", tint = if (isFullAccessAllowed) MojCyan else Color.Gray)
                     }
-                    IconButton(onClick = onTakeCameraPhoto, enabled = isConnected) {
-                        Icon(Icons.Default.PhotoCamera, contentDescription = "عکس با دوربین", tint = MojCyan)
+                    IconButton(onClick = { requireFullAccess(onTakeCameraPhoto) }, enabled = isConnected) {
+                        Icon(Icons.Default.PhotoCamera, contentDescription = "عکس با دوربین", tint = if (isFullAccessAllowed) MojCyan else Color.Gray)
                     }
-                    IconButton(onClick = onPickFile, enabled = isConnected) {
-                        Icon(Icons.Default.AttachFile, contentDescription = "ارسال فایل", tint = MojCyan)
+                    IconButton(onClick = { requireFullAccess(onPickFile) }, enabled = isConnected) {
+                        Icon(Icons.Default.AttachFile, contentDescription = "ارسال فایل", tint = if (isFullAccessAllowed) MojCyan else Color.Gray)
                     }
-                    IconButton(onClick = onToggleMyCamera, enabled = isConnected) {
+                    IconButton(onClick = { requireFullAccess(onToggleMyCamera) }, enabled = isConnected) {
                         Icon(
                             Icons.Default.Videocam,
                             contentDescription = "دوربین زنده",
-                            tint = if (isSharingMyCamera) MojRedAlert else MojCyan
+                            tint = when {
+                                !isFullAccessAllowed -> Color.Gray
+                                isSharingMyCamera -> MojRedAlert
+                                else -> MojCyan
+                            }
                         )
                     }
 
-                    // دکمه ضبط ویس (فشار دهید و نگه دارید)
                     Box(
                         modifier = Modifier
                             .size(40.dp)
                             .clip(CircleShape)
-                            .background(if (isRecordingVoice) MojRedAlert else MojCyan)
-                            .pointerInput(isConnected) {
+                            .background(
+                                when {
+                                    !isFullAccessAllowed -> Color.Gray
+                                    isRecordingVoice -> MojRedAlert
+                                    else -> MojCyan
+                                }
+                            )
+                            .pointerInput(isConnected, isFullAccessAllowed) {
                                 detectTapGestures(
                                     onPress = {
                                         if (isConnected) {
-                                            isRecordingVoice = true
-                                            onStartVoiceRecord()
-                                            tryAwaitRelease()
-                                            isRecordingVoice = false
-                                            onStopVoiceRecord()
+                                            if (!isFullAccessAllowed) {
+                                                showActivationDialog = true
+                                            } else {
+                                                isRecordingVoice = true
+                                                onStartVoiceRecord()
+                                                tryAwaitRelease()
+                                                isRecordingVoice = false
+                                                onStopVoiceRecord()
+                                            }
                                         }
                                     }
                                 )
@@ -585,26 +638,71 @@ fun MainRadioScreen(
                     OutlinedTextField(
                         value = messageText,
                         onValueChange = { messageText = it },
-                        placeholder = { Text("پیام متنی...", fontSize = 13.sp) },
+                        enabled = isFullAccessAllowed,
+                        placeholder = {
+                            Text(
+                                text = if (isFullAccessAllowed) "پیام متنی..." else "برای پیام متنی اپ را فعال کنید",
+                                fontSize = 13.sp
+                            )
+                        },
                         singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
                     IconButton(
                         onClick = {
-                            if (messageText.isNotBlank()) {
-                                onSendText(messageText.trim())
-                                messageText = ""
+                            requireFullAccess {
+                                if (messageText.isNotBlank()) {
+                                    onSendText(messageText.trim())
+                                    messageText = ""
+                                }
                             }
                         },
-                        enabled = isConnected && messageText.isNotBlank()
+                        enabled = isConnected && (!isFullAccessAllowed || messageText.isNotBlank())
                     ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "ارسال", tint = MojCyan)
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "ارسال", tint = if (isFullAccessAllowed) MojCyan else Color.Gray)
                     }
                 }
             }
         }
     }
 
+    // پخش‌کننده ویدئو تمام‌صفحه داخل برنامه
+    if (fullScreenVideoPath != null) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    VideoView(ctx).apply {
+                        val controller = MediaController(ctx)
+                        controller.setAnchorView(this)
+                        setMediaController(controller)
+                        setVideoURI(Uri.fromFile(File(fullScreenVideoPath!!)))
+                        setOnPreparedListener { mp ->
+                            mp.isLooping = false
+                            start()
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+            IconButton(
+                onClick = { fullScreenVideoPath = null },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(16.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.6f))
+            ) {
+                Icon(Icons.Default.Close, contentDescription = "بستن ویدئو", tint = Color.White)
+            }
+        }
+    }
+
+    // نمایشگر تمام‌صفحه عکس با زوم دو انگشتی و دانلود اختیاری
     if (fullScreenImagePath != null) {
         var zoomScale by remember { mutableStateOf(1f) }
         var offsetX by remember { mutableStateOf(0f) }
@@ -707,6 +805,75 @@ fun MainRadioScreen(
                 }
             }
         }
+    }
+
+    // پنجره فعال‌سازی اختصاصی هر گوشی
+    if (showActivationDialog) {
+        var activationInput by remember { mutableStateOf("") }
+        var errorMsg by remember { mutableStateOf<String?>(null) }
+
+        AlertDialog(
+            onDismissRequest = { showActivationDialog = false },
+            title = { Text("فعال‌سازی دائمی موج") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "کد دستگاه زیر را برای پشتیبانی بفرستید و کد فعال‌سازی اختصاصی همین گوشی را وارد کنید:",
+                        fontSize = 12.sp
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(MojNavyCard)
+                            .padding(10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = deviceCode,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 18.sp,
+                            color = MojCyan
+                        )
+                        TextButton(onClick = {
+                            clipboard.setText(AnnotatedString(deviceCode))
+                            Toast.makeText(context, "کد دستگاه کپی شد", Toast.LENGTH_SHORT).show()
+                        }) {
+                            Text("کپی")
+                        }
+                    }
+                    OutlinedTextField(
+                        value = activationInput,
+                        onValueChange = {
+                            activationInput = it.uppercase()
+                            errorMsg = null
+                        },
+                        label = { Text("کد فعال‌سازی (۱۰ کاراکتر)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (errorMsg != null) {
+                        Text(errorMsg!!, color = MojRedAlert, fontSize = 12.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    if (onActivateApp(activationInput)) {
+                        Toast.makeText(context, "برنامه با موفقیت برای این گوشی فعال شد!", Toast.LENGTH_LONG).show()
+                        showActivationDialog = false
+                    } else {
+                        errorMsg = "کد فعال‌سازی برای این گوشی نامعتبر است!"
+                    }
+                }) {
+                    Text("فعال‌سازی")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showActivationDialog = false }) { Text("بستن") }
+            }
+        )
     }
 
     if (showQrDialog && qrBitmap != null) {
@@ -833,16 +1000,9 @@ fun MainRadioScreen(
                             Text("${member.nickname} ${if (member.isHost) "(مدیر)" else ""}", fontWeight = FontWeight.Medium)
                             Text(if (member.isOnline) "آنلاین" else "آفلاین", fontSize = 11.sp, color = MojGreenOnline)
                         }
-                        Row {
-                            if (member.isSharingCamera) {
-                                TextButton(onClick = { onRequestWatchCamera(member.userId) }) {
-                                    Text("دیدن دوربین", color = MojCyan, fontSize = 12.sp)
-                                }
-                            }
-                            if (isHost && !member.isHost) {
-                                TextButton(onClick = { onKickMember(member.userId) }) {
-                                    Text("حذف", color = MojRedAlert, fontSize = 12.sp)
-                                }
+                        if (isHost && !member.isHost) {
+                            TextButton(onClick = { onKickMember(member.userId) }) {
+                                Text("حذف", color = MojRedAlert, fontSize = 12.sp)
                             }
                         }
                     }
