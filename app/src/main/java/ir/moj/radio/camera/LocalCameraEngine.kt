@@ -44,6 +44,9 @@ class LocalCameraEngine(
     private val _isSharingMyCamera = MutableStateFlow(false)
     val isSharingMyCamera: StateFlow<Boolean> = _isSharingMyCamera
 
+    private val _localPreviewFrame = MutableStateFlow<Bitmap?>(null)
+    val localPreviewFrame: StateFlow<Bitmap?> = _localPreviewFrame
+
     private val _pendingViewRequests = MutableStateFlow<List<CameraViewRequest>>(emptyList())
     val pendingViewRequests: StateFlow<List<CameraViewRequest>> = _pendingViewRequests
 
@@ -88,6 +91,7 @@ class LocalCameraEngine(
     fun stopSharing() {
         cameraProvider?.unbindAll()
         approvedViewers.clear()
+        _localPreviewFrame.value = null
         _isSharingMyCamera.value = false
         onSharingStateChanged(false)
     }
@@ -121,11 +125,20 @@ class LocalCameraEngine(
             try {
                 val now = System.currentTimeMillis()
                 val minIntervalMs = 1000L / quality.targetFps
-                if (now - lastFrameSentTimeMs >= minIntervalMs && approvedViewers.isNotEmpty()) {
+                if (now - lastFrameSentTimeMs >= minIntervalMs) {
                     lastFrameSentTimeMs = now
                     val jpeg = imageProxyToJpeg(imageProxy, quality.jpegQuality)
                     if (jpeg != null) {
-                        onEncodedFrameReady(approvedViewers.toSet(), jpeg)
+                        val rawBitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+                        if (rawBitmap != null) {
+                            val rotated = rotateBitmap(rawBitmap, imageProxy.imageInfo.rotationDegrees.toFloat())
+                            _localPreviewFrame.value = rotated
+                            if (approvedViewers.isNotEmpty()) {
+                                val out = ByteArrayOutputStream()
+                                rotated.compress(Bitmap.CompressFormat.JPEG, quality.jpegQuality, out)
+                                onEncodedFrameReady(approvedViewers.toSet(), out.toByteArray())
+                            }
+                        }
                     }
                 }
             } finally {
@@ -135,6 +148,12 @@ class LocalCameraEngine(
 
         val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
         provider.bindToLifecycle(lifecycleOwner, selector, analysis)
+    }
+
+    private fun rotateBitmap(source: Bitmap, degrees: Float): Bitmap {
+        if (degrees == 0f) return source
+        val matrix = Matrix().apply { postRotate(degrees) }
+        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
     }
 
     private fun imageProxyToJpeg(image: ImageProxy, quality: Int): ByteArray? {
