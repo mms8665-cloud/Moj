@@ -1,8 +1,10 @@
 package ir.moj.radio.ui.screens
 
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -49,6 +51,7 @@ fun MainRadioScreen(
     joinCode: String?,
     hotspotInfo: String?,
     qrBitmap: Bitmap?,
+    localCameraFrame: Bitmap?,
     isHost: Boolean,
     isConnected: Boolean,
     staApSupported: Boolean,
@@ -89,6 +92,7 @@ fun MainRadioScreen(
     var showConnectDialog by remember { mutableStateOf(false) }
     var showQrDialog by remember { mutableStateOf(false) }
     var showMembersSheet by remember { mutableStateOf(false) }
+    var fullScreenImagePath by remember { mutableStateOf<String?>(null) }
 
     Scaffold(
         modifier = Modifier
@@ -228,14 +232,48 @@ fun MainRadioScreen(
                 }
             }
 
-            if (remoteCameras.isNotEmpty()) {
+            if (localCameraFrame != null || remoteCameras.isNotEmpty()) {
                 LazyRow(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(155.dp)
+                        .height(170.dp)
                         .padding(horizontal = 8.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    if (localCameraFrame != null) {
+                        item(key = "my_local_camera") {
+                            Box(
+                                modifier = Modifier
+                                    .width(200.dp)
+                                    .fillMaxHeight()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color.Black)
+                            ) {
+                                Image(
+                                    bitmap = localCameraFrame.asImageBitmap(),
+                                    contentDescription = "دوربین شما",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                                Text(
+                                    text = "دوربین شما (زنده)",
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    modifier = Modifier
+                                        .align(Alignment.TopStart)
+                                        .background(Color.Black.copy(alpha = 0.6f))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                                IconButton(
+                                    onClick = onToggleMyCamera,
+                                    modifier = Modifier.align(Alignment.TopEnd).size(28.dp)
+                                ) {
+                                    Icon(Icons.Default.Close, contentDescription = "توقف", tint = Color.White)
+                                }
+                            }
+                        }
+                    }
+
                     items(remoteCameras, key = { it.ownerId }) { stream ->
                         Box(
                             modifier = Modifier
@@ -279,6 +317,16 @@ fun MainRadioScreen(
                 contentPadding = PaddingValues(vertical = 8.dp)
             ) {
                 items(transfers, key = { it.transferId }) { transfer ->
+                    val isImageFile = remember(transfer.fileName) {
+                        val lower = transfer.fileName.lowercase()
+                        lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp")
+                    }
+                    val previewBitmap = remember(transfer.localFilePath, transfer.isCompleted) {
+                        if (isImageFile && transfer.localFilePath != null && (transfer.isCompleted || transfer.isOutgoing)) {
+                            runCatching { BitmapFactory.decodeFile(transfer.localFilePath) }.getOrNull()
+                        } else null
+                    }
+
                     Card(
                         colors = CardDefaults.cardColors(containerColor = MojNavyCard),
                         modifier = Modifier.fillMaxWidth()
@@ -301,6 +349,22 @@ fun MainRadioScreen(
                                     }
                                 }
                             }
+
+                            if (previewBitmap != null) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Image(
+                                    bitmap = previewBitmap.asImageBitmap(),
+                                    contentDescription = transfer.fileName,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(190.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable { fullScreenImagePath = transfer.localFilePath }
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                            }
+
                             LinearProgressIndicator(
                                 progress = { transfer.progressPercent / 100f },
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
@@ -440,6 +504,31 @@ fun MainRadioScreen(
                 }
             }
         }
+    }
+
+    if (fullScreenImagePath != null) {
+        val fullBmp = remember(fullScreenImagePath) {
+            runCatching { BitmapFactory.decodeFile(fullScreenImagePath) }.getOrNull()
+        }
+        AlertDialog(
+            onDismissRequest = { fullScreenImagePath = null },
+            text = {
+                if (fullBmp != null) {
+                    Image(
+                        bitmap = fullBmp.asImageBitmap(),
+                        contentDescription = "نمایش کامل عکس",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 460.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = { fullScreenImagePath = null }) { Text("بستن") }
+            }
+        )
     }
 
     if (showQrDialog && qrBitmap != null) {
