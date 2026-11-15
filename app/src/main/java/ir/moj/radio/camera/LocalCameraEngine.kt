@@ -119,6 +119,7 @@ class LocalCameraEngine(
         val analysis = ImageAnalysis.Builder()
             .setTargetResolution(Size(quality.width, quality.height))
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .build()
 
         analysis.setAnalyzer(cameraExecutor) { imageProxy ->
@@ -127,17 +128,14 @@ class LocalCameraEngine(
                 val minIntervalMs = 1000L / quality.targetFps
                 if (now - lastFrameSentTimeMs >= minIntervalMs) {
                     lastFrameSentTimeMs = now
-                    val jpeg = imageProxyToJpeg(imageProxy, quality.jpegQuality)
-                    if (jpeg != null) {
-                        val rawBitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
-                        if (rawBitmap != null) {
-                            val rotated = rotateBitmap(rawBitmap, imageProxy.imageInfo.rotationDegrees.toFloat())
-                            _localPreviewFrame.value = rotated
-                            if (approvedViewers.isNotEmpty()) {
-                                val out = ByteArrayOutputStream()
-                                rotated.compress(Bitmap.CompressFormat.JPEG, quality.jpegQuality, out)
-                                onEncodedFrameReady(approvedViewers.toSet(), out.toByteArray())
-                            }
+                    val bitmap = imageProxyToBitmap(imageProxy)
+                    if (bitmap != null) {
+                        val rotated = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees.toFloat())
+                        _localPreviewFrame.value = rotated
+                        if (approvedViewers.isNotEmpty()) {
+                            val out = ByteArrayOutputStream()
+                            rotated.compress(Bitmap.CompressFormat.JPEG, quality.jpegQuality, out)
+                            onEncodedFrameReady(approvedViewers.toSet(), out.toByteArray())
                         }
                     }
                 }
@@ -150,30 +148,26 @@ class LocalCameraEngine(
         provider.bindToLifecycle(lifecycleOwner, selector, analysis)
     }
 
+    private fun imageProxyToBitmap(image: ImageProxy): Bitmap? {
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        val rowPadding = rowStride - pixelStride * image.width
+        val bitmap = Bitmap.createBitmap(
+            image.width + rowPadding / pixelStride,
+            image.height,
+            Bitmap.Config.ARGB_8888
+        )
+        bitmap.copyPixelsFromBuffer(buffer)
+        if (rowPadding == 0) return bitmap
+        return Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
+    }
+
     private fun rotateBitmap(source: Bitmap, degrees: Float): Bitmap {
         if (degrees == 0f) return source
         val matrix = Matrix().apply { postRotate(degrees) }
         return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
-    }
-
-    private fun imageProxyToJpeg(image: ImageProxy, quality: Int): ByteArray? {
-        val yBuffer = image.planes[0].buffer
-        val uBuffer = image.planes[1].buffer
-        val vBuffer = image.planes[2].buffer
-
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-
-        val nv21 = ByteArray(ySize + uSize + vSize)
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
-
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), quality, out)
-        return out.toByteArray()
     }
 
     fun release() {
