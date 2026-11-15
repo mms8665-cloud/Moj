@@ -8,7 +8,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.collectAsState
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
 import ir.moj.radio.audio.PttAudioEngine
@@ -61,7 +65,6 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? -> uri?.let { copyUriAndSend(it, "file_${System.currentTimeMillis()}.bin") } }
 
-    private var tempPhotoFile: File? = null
     private val takePictureLauncher = registerForActivityResult(
         ActivityResultContracts.TakePicturePreview()
     ) { bitmap ->
@@ -364,7 +367,7 @@ class MainActivity : ComponentActivity() {
         permissionLauncher.launch(perms.toTypedArray())
     }
 
-    override fun onDestroy() {
+    override onDestroy() {
         super.onDestroy()
         pttEngine.release()
         cameraEngine.release()
