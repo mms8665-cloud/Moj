@@ -17,9 +17,12 @@ class PttAudioEngine(
     private val channelOut = AudioFormat.CHANNEL_OUT_MONO
     private val encoding = AudioFormat.ENCODING_PCM_16BIT
 
+    private val engineScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var recordJob: Job? = null
+    private var watchdogJob: Job? = null
     private var audioTrack: AudioTrack? = null
 
+    @Volatile private var lastRemoteFrameTimeMs: Long = 0L
     @Volatile var rogerBeepEnabled: Boolean = true
     @Volatile var outputVolume: Float = 1.0f
         set(value) {
@@ -62,8 +65,14 @@ class PttAudioEngine(
 
     @SuppressLint("MissingPermission")
     fun startTransmitting(scope: CoroutineScope, myNickname: String): Boolean {
-        if (_activeSpeakerName.value != null && _activeSpeakerName.value != myNickname) {
-            return false // کانال مشغول است (مدیریت نوبت صحبت)
+        val currentSpeaker = _activeSpeakerName.value
+        if (currentSpeaker != null && currentSpeaker != myNickname) {
+            // اگر بیش از ۸۰۰ میلی‌ثانیه صدایی نیامده، قفل کانال را خودکار باز کن
+            if (System.currentTimeMillis() - lastRemoteFrameTimeMs > 800L) {
+                _activeSpeakerName.value = null
+            } else {
+                return false
+            }
         }
         if (_isTransmitting.value) return true
 
@@ -72,7 +81,7 @@ class PttAudioEngine(
 
         recordJob = scope.launch(Dispatchers.IO) {
             val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelIn, encoding)
-            val frameSize = 1280 // 40ms PCM 16-bit @ 16kHz
+            val frameSize = 1280
             val recorder = AudioRecord(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 sampleRate,
@@ -98,7 +107,6 @@ class PttAudioEngine(
     }
 
     fun stopTransmitting() {
-        if (!_isTransmitting.value) return
         _isTransmitting.value = false
         recordJob?.cancel()
         recordJob = null
@@ -108,12 +116,24 @@ class PttAudioEngine(
     }
 
     fun onRemoteAudioReceived(senderNickname: String, pcmData: ByteArray) {
+        if (_isTransmitting.value) return
         initializePlayback()
+        lastRemoteFrameTimeMs = System.currentTimeMillis()
         _activeSpeakerName.value = senderNickname
         audioTrack?.write(pcmData, 0, pcmData.size)
+
+        // آزادسازی خودکار کانال اگر به مدت ۶۰۰ میلی‌ثانیه بسته صوتی جدیدی نرسد
+        watchdogJob?.cancel()
+        watchdogJob = engineScope.launch {
+            delay(600L)
+            if (!_isTransmitting.value && System.currentTimeMillis() - lastRemoteFrameTimeMs >= 550L) {
+                _activeSpeakerName.value = null
+            }
+        }
     }
 
     fun onRemoteTransmitEnded() {
+        watchdogJob?.cancel()
         _activeSpeakerName.value = null
         if (rogerBeepEnabled) playRogerBeep()
     }
@@ -134,6 +154,8 @@ class PttAudioEngine(
 
     fun release() {
         stopTransmitting()
+        watchdogJob?.cancel()
+        engineScope.cancel()
         runCatching { audioTrack?.stop() }
         audioTrack?.release()
         audioTrack = null
