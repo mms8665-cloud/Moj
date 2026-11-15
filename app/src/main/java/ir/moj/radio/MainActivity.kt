@@ -23,6 +23,7 @@ import com.journeyapps.barcodescanner.BarcodeEncoder
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import ir.moj.radio.audio.PttAudioEngine
+import ir.moj.radio.audio.VoiceRecorderPlayer
 import ir.moj.radio.camera.LocalCameraEngine
 import ir.moj.radio.data.*
 import ir.moj.radio.file.ChunkFileTransfer
@@ -54,6 +55,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var wifiHotspotManager: WifiHotspotManager
     private lateinit var meshRouter: MeshRouter
     private lateinit var pttEngine: PttAudioEngine
+    private lateinit var voiceRecorderPlayer: VoiceRecorderPlayer
     private lateinit var fileTransfer: ChunkFileTransfer
     private lateinit var cameraEngine: LocalCameraEngine
 
@@ -135,6 +137,7 @@ class MainActivity : ComponentActivity() {
         userPrefs = UserPrefs(this)
         udpDiscovery = UdpDiscovery(this)
         wifiHotspotManager = WifiHotspotManager(this)
+        voiceRecorderPlayer = VoiceRecorderPlayer(this)
 
         requestRequiredPermissions()
         initEngines()
@@ -204,7 +207,7 @@ class MainActivity : ComponentActivity() {
                             staApSupported = udpDiscovery.isStaApConcurrencySupported(),
                             activeSpeaker = activeSpeaker,
                             isTransmitting = isTransmitting,
-                            isSharingMyCamera = isSharingCam,
+                            isSharingMyCamera = isSharingMyCamera,
                             messages = chatMessages,
                             transfers = transfersMap.values.toList(),
                             members = members,
@@ -216,6 +219,14 @@ class MainActivity : ComponentActivity() {
                             onJoinNetwork = { ip, port, code -> joinLocalNetwork(ip, port, code) },
                             onScanQrCode = { launchQrScanner() },
                             onOpenWifiPanel = { wifiHotspotManager.openWifiPanel() },
+                            onStartVoiceRecord = { voiceRecorderPlayer.startRecording() },
+                            onStopVoiceRecord = {
+                                val voiceFile = voiceRecorderPlayer.stopRecording()
+                                if (voiceFile != null && voiceFile.exists()) {
+                                    fileTransfer.sendFile(lifecycleScope, voiceFile)
+                                }
+                            },
+                            onPlayVoice = { file -> voiceRecorderPlayer.playVoice(file) {} },
                             onApproveMember = { id -> approveMember(id) },
                             onRejectMember = { id -> rejectMember(id) },
                             onKickMember = { id -> kickMember(id) },
