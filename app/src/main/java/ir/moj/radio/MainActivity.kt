@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -33,6 +34,7 @@ import ir.moj.radio.network.MeshRouter
 import ir.moj.radio.network.UdpDiscovery
 import ir.moj.radio.network.WifiHotspotManager
 import ir.moj.radio.security.CryptoManager
+import ir.moj.radio.security.LicenseManager
 import ir.moj.radio.service.MojForegroundService
 import ir.moj.radio.ui.screens.*
 import ir.moj.radio.ui.theme.MojTheme
@@ -49,6 +51,7 @@ import java.util.*
 class MainActivity : ComponentActivity() {
 
     private lateinit var userPrefs: UserPrefs
+    private lateinit var licenseManager: LicenseManager
     private val cryptoManager = CryptoManager()
     private val memberManager = MemberManager()
     private lateinit var udpDiscovery: UdpDiscovery
@@ -64,6 +67,9 @@ class MainActivity : ComponentActivity() {
     )
     private var isConnected by mutableStateOf(false)
     private var isHost by mutableStateOf(false)
+    private var isFullAccessAllowed by mutableStateOf(true)
+    private var isActivated by mutableStateOf(false)
+    private var remainingTrialHours by mutableStateOf(48L)
     private var activeNetworkName by mutableStateOf("شبکه محلی موج")
     private var activeJoinCode by mutableStateOf<String?>(null)
     private var hotspotInfo by mutableStateOf<String?>(null)
@@ -135,6 +141,9 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         userPrefs = UserPrefs(this)
+        licenseManager = LicenseManager(this)
+        refreshLicenseState()
+
         udpDiscovery = UdpDiscovery(this)
         wifiHotspotManager = WifiHotspotManager(this)
         voiceRecorderPlayer = VoiceRecorderPlayer(this)
@@ -165,7 +174,6 @@ class MainActivity : ComponentActivity() {
                 val transfersMap by fileTransfer.transfers.collectAsState()
                 val isSharingCam by cameraEngine.isSharingMyCamera.collectAsState()
                 val localCamFrame by cameraEngine.localPreviewFrame.collectAsState()
-                val camRequests by cameraEngine.pendingViewRequests.collectAsState()
                 val remoteCams by cameraEngine.remoteStreams.collectAsState()
 
                 if (currentSettings.nickname.isBlank()) {
@@ -205,6 +213,10 @@ class MainActivity : ComponentActivity() {
                             isHost = isHost,
                             isConnected = isConnected,
                             staApSupported = udpDiscovery.isStaApConcurrencySupported(),
+                            isFullAccessAllowed = isFullAccessAllowed,
+                            isActivated = isActivated,
+                            remainingTrialHours = remainingTrialHours,
+                            deviceCode = licenseManager.getDeviceCode(),
                             activeSpeaker = activeSpeaker,
                             isTransmitting = isTransmitting,
                             isSharingMyCamera = isSharingCam,
@@ -212,9 +224,13 @@ class MainActivity : ComponentActivity() {
                             transfers = transfersMap.values.toList(),
                             members = members,
                             pendingJoinRequests = pendingJoins,
-                            pendingCameraRequests = camRequests,
                             remoteCameras = remoteCams.values.toList(),
                             discoveredNetworks = discovered,
+                            onActivateApp = { code ->
+                                val ok = licenseManager.activate(code)
+                                if (ok) refreshLicenseState()
+                                ok
+                            },
                             onCreateNetwork = { createLocalNetwork() },
                             onJoinNetwork = { ip, port, code -> joinLocalNetwork(ip, port, code) },
                             onScanQrCode = { launchQrScanner() },
@@ -226,7 +242,8 @@ class MainActivity : ComponentActivity() {
                                     fileTransfer.sendFile(lifecycleScope, voiceFile)
                                 }
                             },
-                            onPlayVoice = { file -> voiceRecorderPlayer.playVoice(file) {} },
+                            onPlayAudio = { file -> voiceRecorderPlayer.playVoice(file) {} },
+                            onStopAudio = { voiceRecorderPlayer.stopPlayback() },
                             onApproveMember = { id -> approveMember(id) },
                             onRejectMember = { id -> rejectMember(id) },
                             onKickMember = { id -> kickMember(id) },
@@ -242,9 +259,6 @@ class MainActivity : ComponentActivity() {
                                 else cameraEngine.startSharing(this@MainActivity, useFrontCamera = false)
                             },
                             onSwitchMyCamera = { cameraEngine.switchCamera(this@MainActivity) },
-                            onRequestWatchCamera = { ownerId -> requestWatchCamera(ownerId) },
-                            onApproveCameraViewer = { reqId -> cameraEngine.approveViewer(reqId) },
-                            onRejectCameraViewer = { reqId -> cameraEngine.rejectViewer(reqId) },
                             onStopWatchingCamera = { ownerId -> cameraEngine.stopWatchingRemote(ownerId) },
                             onOpenSettings = { currentScreen = "settings" },
                             onOpenGuide = { currentScreen = "guide" }
@@ -253,6 +267,12 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun refreshLicenseState() {
+        isActivated = licenseManager.isActivated()
+        isFullAccessAllowed = licenseManager.isFullAccessAllowed()
+        remainingTrialHours = licenseManager.remainingTrialHours()
     }
 
     private fun launchQrScanner() {
@@ -291,10 +311,8 @@ class MainActivity : ComponentActivity() {
 
         cameraEngine = LocalCameraEngine(
             context = this,
-            onEncodedFrameReady = { targetIds, jpeg ->
-                targetIds.forEach { targetId ->
-                    sendPacket(PacketType.CAMERA_LIVE_FRAME, jpeg, targetId = targetId)
-                }
+            onEncodedFrameReady = { jpeg ->
+                sendPacket(PacketType.CAMERA_LIVE_FRAME, jpeg, targetId = null)
             },
             onSharingStateChanged = { sharing ->
                 memberManager.updateCameraSharing(currentSettings.userId, sharing)
@@ -399,10 +417,6 @@ class MainActivity : ComponentActivity() {
         addChatItem(currentSettings.nickname, text, isMine = true)
     }
 
-    private fun requestWatchCamera(ownerId: String) {
-        sendPacket(PacketType.CAMERA_VIEW_REQUEST, currentSettings.nickname.toByteArray(), targetId = ownerId)
-    }
-
     private fun sendPacket(type: PacketType, payload: ByteArray, targetId: String? = null) {
         val packet = MeshPacket(
             type = type,
@@ -447,23 +461,35 @@ class MainActivity : ComponentActivity() {
             PacketType.VOICE_PTT_FRAME -> pttEngine.onRemoteAudioReceived(packet.senderNickname, packet.payload)
             PacketType.VOICE_PTT_END -> pttEngine.onRemoteTransmitEnded()
             PacketType.FILE_CHUNK -> fileTransfer.onChunkReceived(packet.payload)
-            PacketType.CAMERA_VIEW_REQUEST -> {
-                cameraEngine.onIncomingViewRequest(packet.senderId, packet.senderNickname)
-                notifyIfEnabled("درخواست دوربین زنده", "${packet.senderNickname} درخواست مشاهده دوربین شما را دارد")
-            }
             PacketType.CAMERA_VIEW_RESPONSE -> memberManager.updateCameraSharing(packet.senderId, true)
-            PacketType.CAMERA_LIVE_FRAME -> cameraEngine.onRemoteFrameReceived(packet.senderId, packet.senderNickname, packet.payload)
+            PacketType.CAMERA_LIVE_FRAME -> {
+                if (packet.senderId != currentSettings.userId) {
+                    cameraEngine.onRemoteFrameReceived(packet.senderId, packet.senderNickname, packet.payload)
+                }
+            }
             PacketType.CAMERA_STOPPED -> {
                 memberManager.updateCameraSharing(packet.senderId, false)
                 cameraEngine.stopWatchingRemote(packet.senderId)
             }
-            PacketType.MEMBER_LIST_SYNC -> Unit
+            PacketType.CAMERA_VIEW_REQUEST, PacketType.MEMBER_LIST_SYNC -> Unit
         }
+    }
+
+    private fun getFileNameFromUri(uri: Uri, fallback: String): String {
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (nameIdx >= 0 && cursor.moveToFirst()) {
+                val name = cursor.getString(nameIdx)
+                if (!name.isNullOrBlank()) return name
+            }
+        }
+        return fallback
     }
 
     private fun copyUriAndSend(uri: Uri, fallbackName: String) {
         lifecycleScope.launch(Dispatchers.IO) {
-            val outFile = File(cacheDir, fallbackName)
+            val realName = getFileNameFromUri(uri, fallbackName)
+            val outFile = File(cacheDir, realName)
             contentResolver.openInputStream(uri)?.use { input ->
                 FileOutputStream(outFile).use { output -> input.copyTo(output) }
             }
@@ -513,6 +539,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         pttEngine.release()
+        voiceRecorderPlayer.stopPlayback()
         cameraEngine.release()
         udpDiscovery.stopBroadcasting()
         udpDiscovery.stopListening()
