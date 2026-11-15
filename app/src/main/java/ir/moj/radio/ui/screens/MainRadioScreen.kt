@@ -47,6 +47,7 @@ fun MainRadioScreen(
     myNickname: String,
     networkName: String,
     joinCode: String?,
+    hotspotInfo: String?,
     qrBitmap: Bitmap?,
     isHost: Boolean,
     isConnected: Boolean,
@@ -64,6 +65,7 @@ fun MainRadioScreen(
     onCreateNetwork: () -> Unit,
     onJoinNetwork: (hostIp: String, port: Int, code: String) -> Unit,
     onScanQrCode: () -> Unit,
+    onOpenWifiPanel: () -> Unit,
     onApproveMember: (String) -> Unit,
     onRejectMember: (String) -> Unit,
     onKickMember: (String) -> Unit,
@@ -115,6 +117,9 @@ fun MainRadioScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onOpenWifiPanel) {
+                        Icon(Icons.Default.Wifi, contentDescription = "پنل وای‌فای", tint = MojCyan)
+                    }
                     if (isHost && qrBitmap != null) {
                         IconButton(onClick = { showQrDialog = true }) {
                             Icon(Icons.Default.QrCode, contentDescription = "نمایش QR کد", tint = MojCyan)
@@ -440,7 +445,7 @@ fun MainRadioScreen(
     if (showQrDialog && qrBitmap != null) {
         AlertDialog(
             onDismissRequest = { showQrDialog = false },
-            title = { Text("QR کد اتصال به شبکه") },
+            title = { Text("QR کد اتصال خودکار به شبکه") },
             text = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
                     Image(
@@ -455,6 +460,10 @@ fun MainRadioScreen(
                     Spacer(modifier = Modifier.height(10.dp))
                     Text("شبکه: $networkName", fontSize = 13.sp, fontWeight = FontWeight.Bold)
                     Text("کد اتصال: ${joinCode ?: "-"}", fontSize = 13.sp, color = MojCyan)
+                    if (!hotspotInfo.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(hotspotInfo, fontSize = 11.sp, color = MojGreenOnline)
+                    }
                 }
             },
             confirmButton = {
