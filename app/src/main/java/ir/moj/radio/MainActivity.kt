@@ -4,16 +4,17 @@ import android.Manifest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
 import ir.moj.radio.audio.PttAudioEngine
@@ -31,6 +32,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -219,29 +222,46 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun getLocalIpAddress(): String {
+        return try {
+            NetworkInterface.getNetworkInterfaces().toList()
+                .flatMap { it.inetAddresses.toList() }
+                .firstOrNull { !it.isLoopbackAddress && it is Inet4Address }
+                ?.hostAddress ?: "192.168.43.1"
+        } catch (_: Exception) {
+            "192.168.43.1"
+        }
+    }
+
     private fun createLocalNetwork() {
         val code = cryptoManager.generateJoinCode()
+        val myIp = getLocalIpAddress()
         activeJoinCode = code
-        activeNetworkName = "موج - ${currentSettings.nickname}"
+        activeNetworkName = "موج ($myIp)"
         isHost = true
         isConnected = true
 
         meshRouter.setNetworkKey(code)
         meshRouter.startServer(lifecycleScope)
-        memberManager.registerHost(currentSettings.userId, currentSettings.nickname, "127.0.0.1")
+        memberManager.registerHost(currentSettings.userId, currentSettings.nickname, myIp)
         udpDiscovery.startBroadcasting(lifecycleScope, activeNetworkName)
         pttEngine.initializePlayback()
-        MojForegroundService.start(this, "مدیر شبکه: $activeNetworkName (کد: $code)")
+        runCatching { MojForegroundService.start(this, "مدیر شبکه: $myIp (کد: $code)") }
+        Toast.makeText(this, "شبکه ساخته شد | IP: $myIp | کد: $code", Toast.LENGTH_LONG).show()
     }
 
     private fun joinLocalNetwork(hostIp: String, port: Int, code: String) {
         activeJoinCode = code
         isHost = false
         meshRouter.setNetworkKey(code)
+        Toast.makeText(this, "در حال اتصال به $hostIp:$port ...", Toast.LENGTH_SHORT).show()
         meshRouter.connectToPeer(lifecycleScope, hostIp, port) { ok ->
             if (ok) {
                 sendPacket(PacketType.JOIN_REQUEST, currentSettings.nickname.toByteArray())
-                MojForegroundService.start(this, "در انتظار تأیید مدیر شبکه...")
+                Toast.makeText(this, "درخواست ارسال شد؛ مدیر باید در بخش اعضا تأیید کند", Toast.LENGTH_LONG).show()
+                runCatching { MojForegroundService.start(this, "در انتظار تأیید مدیر شبکه...") }
+            } else {
+                Toast.makeText(this, "اتصال برقرار نشد! IP گوشی مرکزی و اتصال Wi-Fi را چک کنید", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -297,7 +317,10 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     isConnected = true
                     pttEngine.initializePlayback()
+                    memberManager.registerHost(packet.senderId, packet.senderNickname, peerIp)
+                    memberManager.addJoinRequest(currentSettings.userId, currentSettings.nickname, getLocalIpAddress())
                     memberManager.approveMember(currentSettings.userId)
+                    Toast.makeText(this, "اتصال توسط مدیر تأیید شد!", Toast.LENGTH_SHORT).show()
                 }
             }
             PacketType.JOIN_REJECTED, PacketType.MEMBER_KICKED -> {
