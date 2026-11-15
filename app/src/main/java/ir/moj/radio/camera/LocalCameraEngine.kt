@@ -11,7 +11,6 @@ import ir.moj.radio.data.CameraQuality
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.io.ByteArrayOutputStream
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 data class CameraViewRequest(
@@ -29,7 +28,7 @@ typealias RemoteStreamMap = Map<String, RemoteCameraStream>
 
 class LocalCameraEngine(
     private val context: Context,
-    private val onEncodedFrameReady: (targetUserIds: Set<String>, jpegBytes: ByteArray) -> Unit,
+    private val onEncodedFrameReady: (jpegBytes: ByteArray) -> Unit,
     private val onSharingStateChanged: (isSharing: Boolean) -> Unit
 ) {
     private val cameraExecutor = Executors.newSingleThreadExecutor()
@@ -38,8 +37,6 @@ class LocalCameraEngine(
     private var lastFrameSentTimeMs: Long = 0L
 
     var currentQuality: CameraQuality = CameraQuality.MEDIUM
-
-    private val approvedViewers = ConcurrentHashMap.newKeySet<String>()
 
     private val _isSharingMyCamera = MutableStateFlow(false)
     val isSharingMyCamera: StateFlow<Boolean> = _isSharingMyCamera
@@ -52,23 +49,6 @@ class LocalCameraEngine(
 
     private val _remoteStreams = MutableStateFlow<RemoteStreamMap>(emptyMap())
     val remoteStreams: StateFlow<RemoteStreamMap> = _remoteStreams
-
-    fun onIncomingViewRequest(requesterId: String, requesterNickname: String) {
-        val current = _pendingViewRequests.value
-        if (current.none { it.requesterId == requesterId }) {
-            _pendingViewRequests.value = current + CameraViewRequest(requesterId, requesterNickname)
-        }
-    }
-
-    fun approveViewer(requesterId: String) {
-        approvedViewers.add(requesterId)
-        _pendingViewRequests.value = _pendingViewRequests.value.filterNot { it.requesterId == requesterId }
-    }
-
-    fun rejectViewer(requesterId: String) {
-        approvedViewers.remove(requesterId)
-        _pendingViewRequests.value = _pendingViewRequests.value.filterNot { it.requesterId == requesterId }
-    }
 
     fun startSharing(lifecycleOwner: LifecycleOwner, useFrontCamera: Boolean = false) {
         lensFacing = if (useFrontCamera) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
@@ -90,7 +70,6 @@ class LocalCameraEngine(
 
     fun stopSharing() {
         cameraProvider?.unbindAll()
-        approvedViewers.clear()
         _localPreviewFrame.value = null
         _isSharingMyCamera.value = false
         onSharingStateChanged(false)
@@ -132,11 +111,9 @@ class LocalCameraEngine(
                     if (bitmap != null) {
                         val rotated = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees.toFloat())
                         _localPreviewFrame.value = rotated
-                        if (approvedViewers.isNotEmpty()) {
-                            val out = ByteArrayOutputStream()
-                            rotated.compress(Bitmap.CompressFormat.JPEG, quality.jpegQuality, out)
-                            onEncodedFrameReady(approvedViewers.toSet(), out.toByteArray())
-                        }
+                        val out = ByteArrayOutputStream()
+                        rotated.compress(Bitmap.CompressFormat.JPEG, quality.jpegQuality, out)
+                        onEncodedFrameReady(out.toByteArray())
                     }
                 }
             } finally {
