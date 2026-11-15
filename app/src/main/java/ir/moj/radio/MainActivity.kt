@@ -161,6 +161,7 @@ class MainActivity : ComponentActivity() {
                 val isTransmitting by pttEngine.isTransmitting.collectAsState()
                 val transfersMap by fileTransfer.transfers.collectAsState()
                 val isSharingCam by cameraEngine.isSharingMyCamera.collectAsState()
+                val localCamFrame by cameraEngine.localPreviewFrame.collectAsState()
                 val camRequests by cameraEngine.pendingViewRequests.collectAsState()
                 val remoteCams by cameraEngine.remoteStreams.collectAsState()
 
@@ -197,6 +198,7 @@ class MainActivity : ComponentActivity() {
                             joinCode = activeJoinCode,
                             hotspotInfo = hotspotInfo,
                             qrBitmap = qrBitmap,
+                            localCameraFrame = localCamFrame,
                             isHost = isHost,
                             isConnected = isConnected,
                             staApSupported = udpDiscovery.isStaApConcurrencySupported(),
@@ -315,12 +317,11 @@ class MainActivity : ComponentActivity() {
         wifiHotspotManager.startLocalHotspot(
             onStarted = { creds ->
                 lifecycleScope.launch {
-                    delay(1200) // صبر برای تخصیص IP هات‌اسپات
+                    delay(1200)
                     startHostServer(creds)
                 }
             },
             onFailed = {
-                // اگر هات‌اسپات معمولی روشن بود یا اجازه نداد، با شبکه فعلی ادامه می‌دهیم
                 startHostServer(null)
             }
         )
