@@ -36,8 +36,10 @@ class ChunkFileTransfer(
     private val activeJobs = ConcurrentHashMap<String, Job>()
     private val incomingFiles = ConcurrentHashMap<String, IncomingSession>()
 
-    private val _transfers = MutableStateFlow>(emptyMap())
-    val transfers: StateFlow> = _transfers
+    typealias TransferMap = Map<String, TransferState>
+        private val _transfers = MutableStateFlow<TransferMap>(emptyMap())
+    val transfers: StateFlow<TransferMap> = _transfers
+
 
     private data class IncomingSession(
         val file: File,
