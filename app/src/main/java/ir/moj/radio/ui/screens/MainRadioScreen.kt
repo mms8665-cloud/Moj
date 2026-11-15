@@ -1,11 +1,17 @@
 package ir.moj.radio.ui.screens
 
+import android.content.ContentValues
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.os.Build
+import android.provider.MediaStore
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -23,8 +29,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -34,6 +42,9 @@ import ir.moj.radio.data.NetworkMember
 import ir.moj.radio.file.TransferState
 import ir.moj.radio.network.DiscoveredNetwork
 import ir.moj.radio.ui.theme.*
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 
 data class ChatItem(
     val id: String,
@@ -88,6 +99,7 @@ fun MainRadioScreen(
     onOpenSettings: () -> Unit,
     onOpenGuide: () -> Unit
 ) {
+    val context = LocalContext.current
     var messageText by remember { mutableStateOf("") }
     var showConnectDialog by remember { mutableStateOf(false) }
     var showQrDialog by remember { mutableStateOf(false) }
@@ -507,28 +519,107 @@ fun MainRadioScreen(
     }
 
     if (fullScreenImagePath != null) {
+        var zoomScale by remember { mutableStateOf(1f) }
+        var offsetX by remember { mutableStateOf(0f) }
+        var offsetY by remember { mutableStateOf(0f) }
+
         val fullBmp = remember(fullScreenImagePath) {
             runCatching { BitmapFactory.decodeFile(fullScreenImagePath) }.getOrNull()
         }
-        AlertDialog(
-            onDismissRequest = { fullScreenImagePath = null },
-            text = {
-                if (fullBmp != null) {
-                    Image(
-                        bitmap = fullBmp.asImageBitmap(),
-                        contentDescription = "نمایش کامل عکس",
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 460.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                    )
-                }
-            },
-            confirmButton = {
-                Button(onClick = { fullScreenImagePath = null }) { Text("بستن") }
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.95f))
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        zoomScale = (zoomScale * zoom).coerceIn(1f, 4f)
+                        if (zoomScale > 1f) {
+                            offsetX += pan.x
+                            offsetY += pan.y
+                        } else {
+                            offsetX = 0f
+                            offsetY = 0f
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            if (fullBmp != null) {
+                Image(
+                    bitmap = fullBmp.asImageBitmap(),
+                    contentDescription = "تصویر تمام صفحه",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = zoomScale,
+                            scaleY = zoomScale,
+                            translationX = offsetX,
+                            translationY = offsetY
+                        )
+                )
             }
-        )
+
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                IconButton(
+                    onClick = {
+                        val srcFile = File(fullScreenImagePath!!)
+                        if (srcFile.exists()) {
+                            runCatching {
+                                val savedName = "MOJ_${System.currentTimeMillis()}.jpg"
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                    val values = ContentValues().apply {
+                                        put(MediaStore.Images.Media.DISPLAY_NAME, savedName)
+                                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/MojRadio")
+                                    }
+                                    val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                                    if (uri != null) {
+                                        context.contentResolver.openOutputStream(uri)?.use { out ->
+                                            FileInputStream(srcFile).use { it.copyTo(out) }
+                                        }
+                                    }
+                                } else {
+                                    val dir = File(context.getExternalFilesDir(null), "Pictures").apply { mkdirs() }
+                                    val dest = File(dir, savedName)
+                                    FileInputStream(srcFile).use { input ->
+                                        FileOutputStream(dest).use { output -> input.copyTo(output) }
+                                    }
+                                }
+                                Toast.makeText(context, "در گالری ذخیره شد", Toast.LENGTH_SHORT).show()
+                            }.onFailure {
+                                Toast.makeText(context, "خطا در ذخیره تصویر", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.5f))
+                ) {
+                    Icon(Icons.Default.Download, contentDescription = "ذخیره در گالری", tint = Color.White)
+                }
+
+                IconButton(
+                    onClick = {
+                        fullScreenImagePath = null
+                        zoomScale = 1f
+                        offsetX = 0f
+                        offsetY = 0f
+                    },
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.5f))
+                ) {
+                    Icon(Icons.Default.Close, contentDescription = "بستن", tint = Color.White)
+                }
+            }
+        }
     }
 
     if (showQrDialog && qrBitmap != null) {
