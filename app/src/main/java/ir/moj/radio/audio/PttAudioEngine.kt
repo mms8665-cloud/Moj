@@ -42,7 +42,7 @@ class PttAudioEngine(
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
@@ -67,7 +67,6 @@ class PttAudioEngine(
     fun startTransmitting(scope: CoroutineScope, myNickname: String): Boolean {
         val currentSpeaker = _activeSpeakerName.value
         if (currentSpeaker != null && currentSpeaker != myNickname) {
-            // اگر بیش از ۸۰۰ میلی‌ثانیه صدایی نیامده، قفل کانال را خودکار باز کن
             if (System.currentTimeMillis() - lastRemoteFrameTimeMs > 800L) {
                 _activeSpeakerName.value = null
             } else {
@@ -122,7 +121,6 @@ class PttAudioEngine(
         _activeSpeakerName.value = senderNickname
         audioTrack?.write(pcmData, 0, pcmData.size)
 
-        // آزادسازی خودکار کانال اگر به مدت ۶۰۰ میلی‌ثانیه بسته صوتی جدیدی نرسد
         watchdogJob?.cancel()
         watchdogJob = engineScope.launch {
             delay(600L)
