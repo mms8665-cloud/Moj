@@ -46,6 +46,7 @@ class LocalCameraEngine(
     val pendingViewRequests: StateFlow<List<CameraViewRequest>> = _pendingViewRequests
 
     private val _remoteStreams = MutableStateFlow>(emptyMap())
+    typealias RemoteStreamMap = Map<String, RemoteCameraStream>
     val remoteStreams: StateFlow> = _remoteStreams
 
     fun onIncomingViewRequest(requesterId: String, requesterNickname: String) {
