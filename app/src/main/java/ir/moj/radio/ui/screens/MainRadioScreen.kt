@@ -49,8 +49,6 @@ import ir.moj.radio.ui.theme.*
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.text.SimpleDateFormat
-import java.util.*
 
 data class ChatItem(
     val id: String,
@@ -149,7 +147,7 @@ fun MainRadioScreen(
                         Text(
                             text = when {
                                 isReconnecting -> "در حال اتصال مجدد خودکار..."
-                                isConnected -> "کد: ${joinCode ?: "-"} \vert{} اعضا: ${members.size}"
+                                isConnected -> "کد: ${joinCode ?: "-"} | اعضا: ${members.size}"
                                 else -> "شبکه بسازید یا QR کد را اسکن کنید"
                             },
                             fontSize = 11.sp,
@@ -259,7 +257,7 @@ fun MainRadioScreen(
                         else -> ""
                     }
                     Text(
-                        text = "$myNickname$roleTag",
+                        text = "$myNickname $roleTag",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium
                     )
@@ -1031,7 +1029,7 @@ fun MainRadioScreen(
                                 isThisDeputy -> "(جانشین)"
                                 else -> ""
                             }
-                            Text("${member.nickname}$badge", fontWeight = FontWeight.Medium)
+                            Text("${member.nickname} $badge", fontWeight = FontWeight.Medium)
                             Text(if (member.isOnline) "آنلاین" else "آفلاین", fontSize = 11.sp, color = MojGreenOnline)
                         }
                         if (isHost && !member.isHost) {
