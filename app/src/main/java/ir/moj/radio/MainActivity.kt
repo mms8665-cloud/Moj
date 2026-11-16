@@ -1,6 +1,7 @@
 package ir.moj.radio
 
 import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
@@ -17,6 +18,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
 import com.google.zxing.BarcodeFormat
@@ -91,11 +93,13 @@ class MainActivity : ComponentActivity() {
     ) { }
 
     private val qrScanLauncher = registerForActivityResult(ScanContract()) { result ->
-        val contents = result.contents ?: return@registerForActivityResult
+        val contents = result?.contents
+        if (contents.isNullOrBlank()) return@registerForActivityResult
+
         val parts = contents.split("#")
         when {
             parts.size == 6 && parts[0] == "MOJ_WIFI" -> {
-                val hostIp = parts[1]
+                val qrHostIp = parts[1]
                 val port = parts[2].toIntOrNull() ?: 45455
                 val code = parts[3]
                 val ssid = parts[4]
@@ -104,24 +108,21 @@ class MainActivity : ComponentActivity() {
                 wifiHotspotManager.connectToWifi(
                     ssid = ssid,
                     password = pass,
-                    onConnected = {
-                        lifecycleScope.launch {
-                            delay(1000)
-                            joinLocalNetwork(hostIp, port, code)
-                        }
+                    onConnected = { detectedGatewayIp ->
+                        val targetIp = detectedGatewayIp ?: qrHostIp
+                        joinLocalNetworkWithFallback(targetIp, qrHostIp, port, code)
                     },
                     onFailed = { msg ->
                         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-                        // اگر کاربر دستی به هات‌اسپات وصل شده، همچنان تلاش برای اتصال به سرور انجام شود
-                        joinLocalNetwork(hostIp, port, code)
                     }
                 )
             }
             parts.size == 4 && parts[0] == "MOJ" -> {
-                val hostIp = parts[1]
+                val qrHostIp = parts[1]
                 val port = parts[2].toIntOrNull() ?: 45455
                 val code = parts[3]
-                joinLocalNetwork(hostIp, port, code)
+                val gwIp = wifiHotspotManager.getWifiGatewayIp()
+                joinLocalNetworkWithFallback(qrHostIp, gwIp, port, code)
             }
             else -> {
                 Toast.makeText(this, "QR کد نامعتبر است!", Toast.LENGTH_SHORT).show()
@@ -294,13 +295,23 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchQrScanner() {
-        val options = ScanOptions().apply {
-            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-            setPrompt("دوربین را روی QR کد گوشی مرکزی یا واسطه بگیرید")
-            setBeepEnabled(true)
-            setOrientationLocked(false)
+        val hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (!hasCamera) {
+            requestRequiredPermissions()
+            Toast.makeText(this, "ابتدا مجوز دوربین را تأیید کنید", Toast.LENGTH_SHORT).show()
+            return
         }
-        qrScanLauncher.launch(options)
+        runCatching {
+            val options = ScanOptions().apply {
+                setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                setPrompt("دوربین را روی QR کد گوشی مرکزی بگیرید")
+                setBeepEnabled(false)
+                setOrientationLocked(true)
+            }
+            qrScanLauncher.launch(options)
+        }.onFailure {
+            Toast.makeText(this, "خطا در باز کردن اسکنر QR", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun generateQrBitmap(content: String): Bitmap? {
@@ -363,7 +374,7 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun getLocalIpAddress(preferHotspot: Boolean = true): String {
+    private fun findRealLocalIp(preferHotspot: Boolean): String? {
         return try {
             val interfaces = NetworkInterface.getNetworkInterfaces().toList()
             val candidates = interfaces.filter { it.isUp && !it.isLoopback }.flatMap { iface ->
@@ -373,19 +384,26 @@ class MainActivity : ComponentActivity() {
             }
             if (preferHotspot) {
                 candidates.firstOrNull { (name, ip) ->
-                    (name.contains("ap") || name.contains("swlan")) && ip.startsWith("192.168.")
+                    (name.contains("ap") || name.contains("swlan") || name.contains("wlan1") || name.contains("wlan2")) && ip.startsWith("192.168.")
                 }?.second
                     ?: candidates.firstOrNull { (name, ip) -> name.contains("wlan") && ip.startsWith("192.168.") }?.second
                     ?: candidates.firstOrNull { (_, ip) -> ip.startsWith("192.168.") }?.second
-                    ?: "192.168.43.1"
             } else {
                 candidates.firstOrNull { (_, ip) -> ip.startsWith("192.168.") }?.second
                     ?: candidates.firstOrNull { (_, ip) -> ip.startsWith("10.") || ip.startsWith("172.") }?.second
-                    ?: "192.168.43.1"
             }
         } catch (_: Exception) {
-            "192.168.43.1"
+            null
         }
+    }
+
+    private suspend fun waitForHotspotIp(): String {
+        repeat(8) {
+            val ip = findRealLocalIp(preferHotspot = true)
+            if (!ip.isNullOrBlank()) return ip
+            delay(500)
+        }
+        return findRealLocalIp(preferHotspot = false) ?: "192.168.43.1"
     }
 
     private fun createLocalNetwork() {
@@ -393,19 +411,21 @@ class MainActivity : ComponentActivity() {
         wifiHotspotManager.startLocalHotspot(
             onStarted = { creds ->
                 lifecycleScope.launch {
-                    delay(1200)
-                    startHostServer(creds)
+                    val realIp = waitForHotspotIp()
+                    startHostServer(creds, realIp)
                 }
             },
             onFailed = {
-                startHostServer(null)
+                val realIp = findRealLocalIp(preferHotspot = true)
+                    ?: findRealLocalIp(preferHotspot = false)
+                    ?: "192.168.43.1"
+                startHostServer(null, realIp)
             }
         )
     }
 
-    private fun startHostServer(creds: LocalHotspotCredentials?) {
+    private fun startHostServer(creds: LocalHotspotCredentials?, myIp: String) {
         val code = cryptoManager.generateJoinCode()
-        val myIp = getLocalIpAddress(preferHotspot = creds != null)
         activeJoinCode = code
         activeNetworkName = "موج ($myIp)"
         isHost = true
@@ -448,8 +468,7 @@ class MainActivity : ComponentActivity() {
         wifiHotspotManager.startLocalHotspot(
             onStarted = { creds ->
                 lifecycleScope.launch {
-                    delay(1200)
-                    val myApIp = getLocalIpAddress(preferHotspot = true)
+                    val myApIp = waitForHotspotIp()
                     meshRouter.startRelayServer(lifecycleScope)
                     isRelay = true
                     hotspotInfo = "واسطه: ${creds.ssid} | رمز: ${creds.password}"
@@ -477,7 +496,7 @@ class MainActivity : ComponentActivity() {
 
     private fun promoteSelfToHost() {
         val code = activeJoinCode ?: return
-        val myIp = getLocalIpAddress(preferHotspot = isRelay)
+        val myIp = findRealLocalIp(preferHotspot = isRelay) ?: "192.168.43.1"
         isHost = true
         isDeputy = false
         isReconnecting = false
@@ -492,6 +511,25 @@ class MainActivity : ComponentActivity() {
         sendPacket(PacketType.MEMBER_LIST_SYNC, "HOST_TAKEOVER#$myIp#45455".toByteArray(Charsets.UTF_8))
         runCatching { MojForegroundService.start(this, "مدیر جدید (جانشین): $myIp") }
         Toast.makeText(this, "مدیر اصلی قطع شد؛ شما اکنون مدیر شبکه هستید!", Toast.LENGTH_LONG).show()
+    }
+
+    private fun joinLocalNetworkWithFallback(primaryIp: String, fallbackIp: String?, port: Int, code: String) {
+        activeJoinCode = code
+        isHost = false
+        meshRouter.setNetworkKey(code)
+        Toast.makeText(this, "در حال اتصال به $primaryIp ...", Toast.LENGTH_SHORT).show()
+        meshRouter.connectToPeer(lifecycleScope, primaryIp, port) { ok ->
+            if (ok) {
+                isReconnecting = false
+                sendPacket(PacketType.JOIN_REQUEST, currentSettings.nickname.toByteArray())
+                Toast.makeText(this, "درخواست ارسال شد؛ مدیر باید تأیید کند", Toast.LENGTH_LONG).show()
+                runCatching { MojForegroundService.start(this, "متصل به شبکه موج") }
+            } else if (!fallbackIp.isNullOrBlank() && fallbackIp != primaryIp) {
+                joinLocalNetwork(fallbackIp, port, code)
+            } else {
+                Toast.makeText(this, "اتصال به $primaryIp برقرار نشد! اتصال وای‌فای را بررسی کنید", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun joinLocalNetwork(hostIp: String, port: Int, code: String) {
@@ -570,7 +608,7 @@ class MainActivity : ComponentActivity() {
                     isReconnecting = false
                     pttEngine.initializePlayback()
                     memberManager.registerHost(packet.senderId, packet.senderNickname, peerIp)
-                    memberManager.addJoinRequest(currentSettings.userId, currentSettings.nickname, getLocalIpAddress(false))
+                    memberManager.addJoinRequest(currentSettings.userId, currentSettings.nickname, findRealLocalIp(false) ?: "192.168.43.1")
                     memberManager.approveMember(currentSettings.userId)
                     Toast.makeText(this, "اتصال به شبکه برقرار شد!", Toast.LENGTH_SHORT).show()
                 }
