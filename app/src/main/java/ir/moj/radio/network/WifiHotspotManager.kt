@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import java.net.Inet4Address
 
 data class LocalHotspotCredentials(
     val ssid: String,
@@ -26,6 +27,7 @@ class WifiHotspotManager(private val context: Context) {
 
     private var hotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var activeNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var boundNetwork: Network? = null
 
     fun openWifiPanel() {
         val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -34,6 +36,26 @@ class WifiHotspotManager(private val context: Context) {
             Intent(Settings.ACTION_WIFI_SETTINGS)
         }.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         runCatching { context.startActivity(intent) }
+    }
+
+    // پیدا کردن IP واقعی گوشی مرکزی (Gateway) پس از اتصال وای‌فای
+    @Suppress("DEPRECATION")
+    fun getWifiGatewayIp(): String? {
+        runCatching {
+            val net = boundNetwork ?: connectivityManager.activeNetwork
+            val props = connectivityManager.getLinkProperties(net)
+            val routeGateway = props?.routes
+                ?.firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address }
+                ?.gateway?.hostAddress
+            if (!routeGateway.isNullOrBlank() && routeGateway != "0.0.0.0") {
+                return routeGateway
+            }
+        }
+        return runCatching {
+            val gw = wifiManager.dhcpInfo?.gateway ?: 0
+            if (gw == 0) null
+            else "${gw and 0xFF}.${(gw shr 8) and 0xFF}.${(gw shr 16) and 0xFF}.${(gw shr 24) and 0xFF}"
+        }.getOrNull()
     }
 
     @SuppressLint("MissingPermission")
@@ -92,7 +114,7 @@ class WifiHotspotManager(private val context: Context) {
     fun connectToWifi(
         ssid: String,
         password: String,
-        onConnected: () -> Unit,
+        onConnected: (gatewayIp: String?) -> Unit,
         onFailed: (String) -> Unit
     ) {
         val cleanSsid = ssid.removeSurrounding("\"").trim()
@@ -100,58 +122,60 @@ class WifiHotspotManager(private val context: Context) {
 
         if (!wifiManager.isWifiEnabled) {
             openWifiPanel()
-            onFailed("ابتدا وای‌فای گوشی را روشن کنید و دوباره QR را اسکن کنید")
+            onFailed("ابتدا وای‌فای را روشن کنید و دوباره QR را اسکن کنید")
             return
         }
 
-        // اگر از قبل به همین هات‌اسپات وصل هستیم، مستقیم ادامه بده
         val currentSsid = runCatching {
             wifiManager.connectionInfo?.ssid?.removeSurrounding("\"")?.trim()
         }.getOrNull()
         if (currentSsid == cleanSsid) {
-            onConnected()
+            onConnected(getWifiGatewayIp())
             return
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             openWifiPanel()
-            onFailed("لطفاً دستی به وای‌فای $cleanSsid با رمز $cleanPass وصل شوید")
+            onFailed("دستی به وای‌فای $cleanSsid با رمز $cleanPass وصل شوید")
             return
         }
 
         disconnectWifi()
 
-        val specifier = WifiNetworkSpecifier.Builder()
-            .setSsid(cleanSsid)
-            .setWpa2Passphrase(cleanPass)
-            .build()
+        try {
+            val specifier = WifiNetworkSpecifier.Builder()
+                .setSsid(cleanSsid)
+                .setWpa2Passphrase(cleanPass)
+                .build()
 
-        val request = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .setNetworkSpecifier(specifier)
-            .build()
+            val request = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .setNetworkSpecifier(specifier)
+                .build()
 
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                super.onAvailable(network)
-                connectivityManager.bindProcessToNetwork(network)
-                Handler(Looper.getMainLooper()).post { onConnected() }
-            }
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    super.onAvailable(network)
+                    boundNetwork = network
+                    connectivityManager.bindProcessToNetwork(network)
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        onConnected(getWifiGatewayIp())
+                    }, 900L)
+                }
 
-            override fun onUnavailable() {
-                super.onUnavailable()
-                Handler(Looper.getMainLooper()).post {
-                    onFailed("اتصال خودکار وای‌فای انجام نشد؛ دستی به $cleanSsid وصل شوید")
+                override fun onUnavailable() {
+                    super.onUnavailable()
+                    Handler(Looper.getMainLooper()).post {
+                        onFailed("اتصال خودکار وای‌فای انجام نشد؛ دستی به $cleanSsid وصل شوید")
+                    }
                 }
             }
-        }
 
-        activeNetworkCallback = callback
-        runCatching {
-            connectivityManager.requestNetwork(request, callback, 20000)
-        }.onFailure {
-            onFailed("خطا در درخواست اتصال وای‌فای")
+            activeNetworkCallback = callback
+            connectivityManager.requestNetwork(request, callback, 25000)
+        } catch (e: Exception) {
+            onFailed("خطا در اتصال وای‌فای: ${e.message ?: "نامشخص"}")
         }
     }
 
@@ -160,6 +184,7 @@ class WifiHotspotManager(private val context: Context) {
             runCatching { connectivityManager.unregisterNetworkCallback(cb) }
         }
         activeNetworkCallback = null
+        boundNetwork = null
         runCatching { connectivityManager.bindProcessToNetwork(null) }
     }
 
