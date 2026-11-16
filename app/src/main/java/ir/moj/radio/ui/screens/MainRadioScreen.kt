@@ -49,6 +49,8 @@ import ir.moj.radio.ui.theme.*
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.*
 
 data class ChatItem(
     val id: String,
@@ -147,7 +149,7 @@ fun MainRadioScreen(
                         Text(
                             text = when {
                                 isReconnecting -> "در حال اتصال مجدد خودکار..."
-                                isConnected -> "کد: ${joinCode ?: "-"} | اعضا: ${members.size}"
+                                isConnected -> "کد: ${joinCode ?: "-"} \vert{} اعضا: ${members.size}"
                                 else -> "شبکه بسازید یا QR کد را اسکن کنید"
                             },
                             fontSize = 11.sp,
@@ -257,7 +259,7 @@ fun MainRadioScreen(
                         else -> ""
                     }
                     Text(
-                        text = "$myNickname $roleTag",
+                        text = "$myNickname$roleTag",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium
                     )
@@ -944,17 +946,16 @@ fun MainRadioScreen(
 
         AlertDialog(
             onDismissRequest = { showConnectDialog = false },
-            title = { Text("اتصال دستی به شبکه موج") },
+            title = { Text("اتصال به شبکه موج با کد") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("ابتدا به وای‌فای/هات‌اسپات گوشی مرکزی وصل شوید، سپس کد اتصال را وارد کنید:", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     if (discoveredNetworks.isNotEmpty()) {
-                        Text("شبکه‌های کشف‌شده:", fontSize = 12.sp, color = MojCyan)
                         discoveredNetworks.forEach { net ->
                             TextButton(onClick = {
                                 ipInput = net.hostIp
-                                portInput = net.tcpPort.toString()
                             }) {
-                                Text("${net.networkName} (${net.hostIp})")
+                                Text("یافت شد: ${net.networkName} (${net.hostIp})")
                             }
                         }
                     }
@@ -967,22 +968,18 @@ fun MainRadioScreen(
                     OutlinedTextField(
                         value = ipInput,
                         onValueChange = { ipInput = it },
-                        label = { Text("آدرس IP گوشی مرکزی") },
-                        singleLine = true
-                    )
-                    OutlinedTextField(
-                        value = portInput,
-                        onValueChange = { portInput = it },
-                        label = { Text("پورت (پیش‌فرض 45455)") },
+                        label = { Text("آدرس IP گوشی مرکزی (پیش‌فرض 192.168.43.1)") },
                         singleLine = true
                     )
                 }
             },
             confirmButton = {
                 Button(onClick = {
-                    if (codeInput.isNotBlank() && ipInput.isNotBlank()) {
-                        onJoinNetwork(ipInput.trim(), portInput.toIntOrNull() ?: 45455, codeInput.trim())
+                    if (codeInput.isNotBlank()) {
+                        onJoinNetwork(ipInput.trim().ifBlank { "192.168.43.1" }, portInput.toIntOrNull() ?: 45455, codeInput.trim())
                         showConnectDialog = false
+                    } else {
+                        Toast.makeText(context, "لطفاً کد اتصال را وارد کنید", Toast.LENGTH_SHORT).show()
                     }
                 }) { Text("اتصال") }
             },
@@ -1034,7 +1031,7 @@ fun MainRadioScreen(
                                 isThisDeputy -> "(جانشین)"
                                 else -> ""
                             }
-                            Text("${member.nickname} $badge", fontWeight = FontWeight.Medium)
+                            Text("${member.nickname}$badge", fontWeight = FontWeight.Medium)
                             Text(if (member.isOnline) "آنلاین" else "آفلاین", fontSize = 11.sp, color = MojGreenOnline)
                         }
                         if (isHost && !member.isHost) {
