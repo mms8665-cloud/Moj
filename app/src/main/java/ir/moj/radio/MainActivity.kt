@@ -64,7 +64,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var fileTransfer: ChunkFileTransfer
     private lateinit var cameraEngine: LocalCameraEngine
 
-    // لیست اعضای تأییدشده برای بازگشت خودکار بدون نیاز به مجوز مجدد
     private val approvedUserIds = ConcurrentHashMap.newKeySet<String>()
     private var deputyFailoverJob: Job? = null
 
@@ -101,18 +100,20 @@ class MainActivity : ComponentActivity() {
                 val code = parts[3]
                 val ssid = parts[4]
                 val pass = parts[5]
-                Toast.makeText(this, "در حال اتصال خودکار به وای‌فای $ssid ...", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "در حال اتصال به وای‌فای $ssid ...", Toast.LENGTH_SHORT).show()
                 wifiHotspotManager.connectToWifi(
                     ssid = ssid,
                     password = pass,
                     onConnected = {
                         lifecycleScope.launch {
-                            delay(800)
+                            delay(1000)
                             joinLocalNetwork(hostIp, port, code)
                         }
                     },
                     onFailed = { msg ->
                         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                        // اگر کاربر دستی به هات‌اسپات وصل شده، همچنان تلاش برای اتصال به سرور انجام شود
+                        joinLocalNetwork(hostIp, port, code)
                     }
                 )
             }
@@ -313,7 +314,6 @@ class MainActivity : ComponentActivity() {
             handleIncomingPacket(packet, peerIp)
         }
 
-        // مدیریت قطع موقت و اتصال مجدد خودکار + انتقال مدیریت به جانشین
         meshRouter.onUpstreamDisconnected = {
             if (!isHost && isConnected) {
                 isReconnecting = true
@@ -417,7 +417,7 @@ class MainActivity : ComponentActivity() {
         approvedUserIds.add(currentSettings.userId)
 
         if (creds != null) {
-            hotspotInfo = "هات‌اسپات محلی روشن است: ${creds.ssid}"
+            hotspotInfo = "وای‌فای: ${creds.ssid} | رمز: ${creds.password}"
             qrBitmap = generateQrBitmap("MOJ_WIFI#$myIp#45455#$code#${creds.ssid}#${creds.password}")
         } else {
             hotspotInfo = "متصل به هات‌اسپات/وای‌فای فعلی گوشی"
@@ -433,7 +433,6 @@ class MainActivity : ComponentActivity() {
         Toast.makeText(this, "شبکه آماده است! آیکن QR بالا را بزنید", Toast.LENGTH_LONG).show()
     }
 
-    // قابلیت ۲: روشن/خاموش کردن حالت گوشی واسطه (Repeater)
     private fun toggleRelayMode() {
         val code = activeJoinCode ?: return
         if (isRelay) {
@@ -453,7 +452,7 @@ class MainActivity : ComponentActivity() {
                     val myApIp = getLocalIpAddress(preferHotspot = true)
                     meshRouter.startRelayServer(lifecycleScope)
                     isRelay = true
-                    hotspotInfo = "واسطه فعال: ${creds.ssid}"
+                    hotspotInfo = "واسطه: ${creds.ssid} | رمز: ${creds.password}"
                     qrBitmap = generateQrBitmap("MOJ_WIFI#$myApIp#45455#$code#${creds.ssid}#${creds.password}")
                     Toast.makeText(this@MainActivity, "حالت واسطه فعال شد! بقیه می‌توانند QR شما را اسکن کنند", Toast.LENGTH_LONG).show()
                 }
@@ -464,7 +463,6 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    // قابلیت ۳: انتخاب جانشین توسط مدیر شبکه
     private fun assignDeputy(userId: String) {
         deputyUserId = userId
         sendPacket(PacketType.MEMBER_LIST_SYNC, "DEPUTY_SET#$userId".toByteArray(Charsets.UTF_8))
@@ -477,7 +475,6 @@ class MainActivity : ComponentActivity() {
         sendPacket(PacketType.MEMBER_LIST_SYNC, "APPROVED_SYNC#$joined".toByteArray(Charsets.UTF_8))
     }
 
-    // ارتقای خودکار جانشین به مدیر جدید در صورت خروج یا قطع شدن مدیر اصلی
     private fun promoteSelfToHost() {
         val code = activeJoinCode ?: return
         val myIp = getLocalIpAddress(preferHotspot = isRelay)
@@ -506,10 +503,10 @@ class MainActivity : ComponentActivity() {
             if (ok) {
                 isReconnecting = false
                 sendPacket(PacketType.JOIN_REQUEST, currentSettings.nickname.toByteArray())
-                Toast.makeText(this, "درخواست ارسال شد...", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "درخواست ارسال شد؛ مدیر باید تأیید کند", Toast.LENGTH_LONG).show()
                 runCatching { MojForegroundService.start(this, "متصل به شبکه موج") }
             } else {
-                Toast.makeText(this, "اتصال برقرار نشد! اتصال وای‌فای را بررسی کنید", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "اتصال به $hostIp برقرار نشد! اتصال وای‌فای را بررسی کنید", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -558,7 +555,6 @@ class MainActivity : ComponentActivity() {
         when (packet.type) {
             PacketType.JOIN_REQUEST -> {
                 if (isHost) {
-                    // قابلیت ۱: اگر قبلاً تأیید شده، بدون نیاز به مجوز مجدد وصل شود
                     if (approvedUserIds.contains(packet.senderId)) {
                         memberManager.addJoinRequest(packet.senderId, packet.senderNickname, peerIp)
                         approveMember(packet.senderId)
