@@ -68,6 +68,10 @@ fun MainRadioScreen(
     qrBitmap: Bitmap?,
     localCameraFrame: Bitmap?,
     isHost: Boolean,
+    isRelay: Boolean,
+    isDeputy: Boolean,
+    deputyUserId: String?,
+    isReconnecting: Boolean,
     isConnected: Boolean,
     staApSupported: Boolean,
     isFullAccessAllowed: Boolean,
@@ -88,6 +92,8 @@ fun MainRadioScreen(
     onJoinNetwork: (hostIp: String, port: Int, code: String) -> Unit,
     onScanQrCode: () -> Unit,
     onOpenWifiPanel: () -> Unit,
+    onToggleRelayMode: () -> Unit,
+    onAssignDeputy: (String) -> Unit,
     onStartVoiceRecord: () -> Unit,
     onStopVoiceRecord: () -> Unit,
     onPlayAudio: (File) -> Unit,
@@ -139,13 +145,17 @@ fun MainRadioScreen(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = if (isConnected) {
-                                "کد: ${joinCode ?: "-"} | اعضا: ${members.size}"
-                            } else {
-                                "شبکه بسازید یا QR کد را اسکن کنید"
+                            text = when {
+                                isReconnecting -> "در حال اتصال مجدد خودکار..."
+                                isConnected -> "کد: ${joinCode ?: "-"} | اعضا: ${members.size}"
+                                else -> "شبکه بسازید یا QR کد را اسکن کنید"
                             },
                             fontSize = 11.sp,
-                            color = if (isConnected) MojGreenOnline else MaterialTheme.colorScheme.onSurfaceVariant
+                            color = when {
+                                isReconnecting -> Color(0xFFFFB703)
+                                isConnected -> MojGreenOnline
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                            }
                         )
                     }
                 },
@@ -162,7 +172,7 @@ fun MainRadioScreen(
                     IconButton(onClick = onOpenWifiPanel) {
                         Icon(Icons.Default.Wifi, contentDescription = "پنل وای‌فای", tint = MojCyan)
                     }
-                    if (isHost && qrBitmap != null) {
+                    if ((isHost || isRelay) && qrBitmap != null) {
                         IconButton(onClick = { showQrDialog = true }) {
                             Icon(Icons.Default.QrCode, contentDescription = "نمایش QR کد", tint = MojCyan)
                         }
@@ -230,11 +240,24 @@ fun MainRadioScreen(
                         modifier = Modifier
                             .size(10.dp)
                             .clip(CircleShape)
-                            .background(if (isConnected) MojGreenOnline else Color.Gray)
+                            .background(
+                                when {
+                                    isReconnecting -> Color(0xFFFFB703)
+                                    isConnected -> MojGreenOnline
+                                    else -> Color.Gray
+                                }
+                            )
                     )
                     Spacer(modifier = Modifier.width(6.dp))
+                    val roleTag = when {
+                        isHost -> "(مدیر)"
+                        isDeputy && isRelay -> "(جانشین/واسطه)"
+                        isDeputy -> "(جانشین)"
+                        isRelay -> "(واسطه)"
+                        else -> ""
+                    }
                     Text(
-                        text = "$myNickname ${if (isHost) "(مدیر)" else ""}",
+                        text = "$myNickname $roleTag",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium
                     )
@@ -263,11 +286,23 @@ fun MainRadioScreen(
                             Text("دستی", fontSize = 11.sp)
                         }
                     }
-                } else if (isSharingMyCamera) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("دوربین شما فعال است", color = MojRedAlert, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        IconButton(onClick = onSwitchMyCamera, modifier = Modifier.size(30.dp)) {
-                            Icon(Icons.Default.Cameraswitch, contentDescription = "تغییر دوربین", tint = MojCyan)
+                } else {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (!isHost && staApSupported) {
+                            FilledTonalButton(
+                                onClick = onToggleRelayMode,
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                colors = ButtonDefaults.filledTonalButtonColors(
+                                    containerColor = if (isRelay) MojGreenOnline.copy(alpha = 0.25f) else MojNavySurface
+                                )
+                            ) {
+                                Text(if (isRelay) "واسطه فعال" else "حالت واسطه", fontSize = 11.sp)
+                            }
+                        }
+                        if (isSharingMyCamera) {
+                            IconButton(onClick = onSwitchMyCamera, modifier = Modifier.size(30.dp)) {
+                                Icon(Icons.Default.Cameraswitch, contentDescription = "تغییر دوربین", tint = MojCyan)
+                            }
                         }
                     }
                 }
@@ -535,7 +570,6 @@ fun MainRadioScreen(
                     Spacer(modifier = Modifier.height(4.dp))
                 }
 
-                // واکی‌تاکی همیشه باز است (حتی بعد از اتمام تست ۲ روزه)
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
@@ -666,7 +700,6 @@ fun MainRadioScreen(
         }
     }
 
-    // پخش‌کننده ویدئو تمام‌صفحه داخل برنامه
     if (fullScreenVideoPath != null) {
         Box(
             modifier = Modifier
@@ -702,7 +735,6 @@ fun MainRadioScreen(
         }
     }
 
-    // نمایشگر تمام‌صفحه عکس با زوم دو انگشتی و دانلود اختیاری
     if (fullScreenImagePath != null) {
         var zoomScale by remember { mutableStateOf(1f) }
         var offsetX by remember { mutableStateOf(0f) }
@@ -807,7 +839,6 @@ fun MainRadioScreen(
         }
     }
 
-    // پنجره فعال‌سازی اختصاصی هر گوشی
     if (showActivationDialog) {
         var activationInput by remember { mutableStateOf("") }
         var errorMsg by remember { mutableStateOf<String?>(null) }
@@ -879,7 +910,7 @@ fun MainRadioScreen(
     if (showQrDialog && qrBitmap != null) {
         AlertDialog(
             onDismissRequest = { showQrDialog = false },
-            title = { Text("QR کد اتصال خودکار به شبکه") },
+            title = { Text(if (isRelay) "QR کد گوشی واسطه (ادامه شبکه)" else "QR کد اتصال خودکار به شبکه") },
             text = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
                     Image(
@@ -966,7 +997,7 @@ fun MainRadioScreen(
             Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                 Text("اعضای شبکه (${members.size})", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 Text(
-                    text = if (staApSupported) "پشتیبانی هم‌زمان Wi-Fi + Hotspot: فعال" else "این گوشی هم‌زمانی Wi-Fi و Hotspot را پشتیبانی نمی‌کند",
+                    text = if (staApSupported) "پشتیبانی هم‌زمان Wi-Fi + Hotspot (واسطه): فعال" else "این گوشی هم‌زمانی Wi-Fi و Hotspot را پشتیبانی نمی‌کند",
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -991,18 +1022,31 @@ fun MainRadioScreen(
                 }
 
                 members.forEach { member ->
+                    val isThisDeputy = deputyUserId == member.userId
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Column {
-                            Text("${member.nickname} ${if (member.isHost) "(مدیر)" else ""}", fontWeight = FontWeight.Medium)
+                            val badge = when {
+                                member.isHost -> "(مدیر)"
+                                isThisDeputy -> "(جانشین)"
+                                else -> ""
+                            }
+                            Text("${member.nickname} $badge", fontWeight = FontWeight.Medium)
                             Text(if (member.isOnline) "آنلاین" else "آفلاین", fontSize = 11.sp, color = MojGreenOnline)
                         }
                         if (isHost && !member.isHost) {
-                            TextButton(onClick = { onKickMember(member.userId) }) {
-                                Text("حذف", color = MojRedAlert, fontSize = 12.sp)
+                            Row {
+                                if (!isThisDeputy) {
+                                    TextButton(onClick = { onAssignDeputy(member.userId) }) {
+                                        Text("انتخاب جانشین", color = MojCyan, fontSize = 12.sp)
+                                    }
+                                }
+                                TextButton(onClick = { onKickMember(member.userId) }) {
+                                    Text("حذف", color = MojRedAlert, fontSize = 12.sp)
+                                }
                             }
                         }
                     }
