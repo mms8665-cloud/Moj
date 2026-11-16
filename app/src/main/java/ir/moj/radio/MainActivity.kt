@@ -1,6 +1,7 @@
 package ir.moj.radio
 
 import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
@@ -22,6 +23,8 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
 import com.google.zxing.BarcodeFormat
 import com.journeyapps.barcodescanner.BarcodeEncoder
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import ir.moj.radio.audio.PttAudioEngine
 import ir.moj.radio.audio.VoiceRecorderPlayer
 import ir.moj.radio.camera.LocalCameraEngine
@@ -88,6 +91,46 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { }
+
+    private val qrScanLauncher = registerForActivityResult(ScanContract()) { result ->
+        val contents = result?.contents
+        if (contents.isNullOrBlank()) return@registerForActivityResult
+
+        val parts = contents.split("#")
+        when {
+            parts.size == 6 && parts[0] == "MOJ_WIFI" -> {
+                val qrHostIp = parts[1]
+                val port = parts[2].toIntOrNull() ?: 45455
+                val code = parts[3]
+                val ssid = parts[4]
+                val pass = parts[5]
+                Toast.makeText(this, "در حال اتصال به وای‌فای $ssid ...", Toast.LENGTH_SHORT).show()
+                wifiHotspotManager.connectToWifi(
+                    ssid = ssid,
+                    password = pass,
+                    onConnected = { detectedGatewayIp ->
+                        val primaryIp = detectedGatewayIp ?: qrHostIp
+                        joinLocalNetworkWithFallback(primaryIp, qrHostIp, port, code)
+                    },
+                    onFailed = { msg ->
+                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                        val gwIp = wifiHotspotManager.getWifiGatewayIp()
+                        joinLocalNetworkWithFallback(qrHostIp, gwIp, port, code)
+                    }
+                )
+            }
+            parts.size == 4 && parts[0] == "MOJ" -> {
+                val qrHostIp = parts[1]
+                val port = parts[2].toIntOrNull() ?: 45455
+                val code = parts[3]
+                val gwIp = wifiHotspotManager.getWifiGatewayIp()
+                joinLocalNetworkWithFallback(qrHostIp, gwIp, port, code)
+            }
+            else -> {
+                Toast.makeText(this, "QR کد نامعتبر است!", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
 
     private val galleryLauncher = registerForActivityResult(
         ActivityResultContracts.GetContent()
@@ -208,10 +251,11 @@ class MainActivity : ComponentActivity() {
                                 ok
                             },
                             onCreateNetwork = { createLocalNetwork() },
-                            onJoinNetwork = { ip, port, code -> joinLocalNetwork(ip, port, code) },
-                            onScanQrCode = {
-                                Toast.makeText(this, "لطفاً از دکمه اتصال دستی استفاده کنید", Toast.LENGTH_SHORT).show()
+                            onJoinNetwork = { ip, port, code ->
+                                val gwIp = wifiHotspotManager.getWifiGatewayIp()
+                                joinLocalNetworkWithFallback(ip, gwIp, port, code)
                             },
+                            onScanQrCode = { launchQrScanner() },
                             onOpenWifiPanel = { wifiHotspotManager.openWifiPanel() },
                             onToggleRelayMode = { toggleRelayMode() },
                             onAssignDeputy = { userId -> assignDeputy(userId) },
@@ -253,6 +297,26 @@ class MainActivity : ComponentActivity() {
         isActivated = licenseManager.isActivated()
         isFullAccessAllowed = licenseManager.isFullAccessAllowed()
         remainingTrialHours = licenseManager.remainingTrialHours()
+    }
+
+    private fun launchQrScanner() {
+        val hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        if (!hasCamera) {
+            requestRequiredPermissions()
+            Toast.makeText(this, "ابتدا مجوز دوربین را تأیید کنید", Toast.LENGTH_SHORT).show()
+            return
+        }
+        runCatching {
+            val options = ScanOptions().apply {
+                setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                setPrompt("دوربین را روی QR کد گوشی مرکزی بگیرید")
+                setBeepEnabled(false)
+                setOrientationLocked(false)
+            }
+            qrScanLauncher.launch(options)
+        }.onFailure {
+            Toast.makeText(this, "خطا در باز کردن اسکنر QR", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun generateQrBitmap(content: String): Bitmap? {
@@ -391,7 +455,7 @@ class MainActivity : ComponentActivity() {
         udpDiscovery.startBroadcasting(lifecycleScope, activeNetworkName)
         pttEngine.initializePlayback()
         runCatching { MojForegroundService.start(this, "مدیر شبکه: $myIp (کد: $code)") }
-        Toast.makeText(this, "شبکه آماده است! دکمه اطلاعات شبکه را بزنید", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "شبکه آماده است! آیکن QR بالا را بزنید", Toast.LENGTH_LONG).show()
     }
 
     private fun toggleRelayMode() {
@@ -452,6 +516,25 @@ class MainActivity : ComponentActivity() {
         sendPacket(PacketType.MEMBER_LIST_SYNC, "HOST_TAKEOVER#$myIp#45455".toByteArray(Charsets.UTF_8))
         runCatching { MojForegroundService.start(this, "مدیر جدید (جانشین): $myIp") }
         Toast.makeText(this, "مدیر اصلی قطع شد؛ شما اکنون مدیر شبکه هستید!", Toast.LENGTH_LONG).show()
+    }
+
+    private fun joinLocalNetworkWithFallback(primaryIp: String, fallbackIp: String?, port: Int, code: String) {
+        activeJoinCode = code
+        isHost = false
+        meshRouter.setNetworkKey(code)
+        Toast.makeText(this, "در حال اتصال به $primaryIp ...", Toast.LENGTH_SHORT).show()
+        meshRouter.connectToPeer(lifecycleScope, primaryIp, port) { ok ->
+            if (ok) {
+                isReconnecting = false
+                sendPacket(PacketType.JOIN_REQUEST, currentSettings.nickname.toByteArray())
+                Toast.makeText(this, "درخواست ارسال شد؛ مدیر باید تأیید کند", Toast.LENGTH_LONG).show()
+                runCatching { MojForegroundService.start(this, "متصل به شبکه موج") }
+            } else if (!fallbackIp.isNullOrBlank() && fallbackIp != primaryIp) {
+                joinLocalNetwork(fallbackIp, port, code)
+            } else {
+                Toast.makeText(this, "اتصال به $primaryIp برقرار نشد! دیتای سیم‌کارت را خاموش و وای‌فای را بررسی کنید", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun joinLocalNetwork(hostIp: String, port: Int, code: String) {
