@@ -52,17 +52,19 @@ class WifiHotspotManager(private val context: Context) {
                         return
                     }
                     hotspotReservation = reservation
-                    val ssid: String
-                    val pass: String
+                    val rawSsid: String
+                    val rawPass: String
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         val config = reservation.softApConfiguration
-                        ssid = config.ssid ?: ""
-                        pass = config.passphrase ?: ""
+                        rawSsid = config.ssid ?: ""
+                        rawPass = config.passphrase ?: ""
                     } else {
                         val config = reservation.wifiConfiguration
-                        ssid = config?.SSID ?: ""
-                        pass = config?.preSharedKey ?: ""
+                        rawSsid = config?.SSID ?: ""
+                        rawPass = config?.preSharedKey ?: ""
                     }
+                    val ssid = rawSsid.removeSurrounding("\"").trim()
+                    val pass = rawPass.removeSurrounding("\"").trim()
                     if (ssid.isNotBlank() && pass.isNotBlank()) {
                         onStarted(LocalHotspotCredentials(ssid, pass))
                     } else {
@@ -85,23 +87,43 @@ class WifiHotspotManager(private val context: Context) {
         hotspotReservation = null
     }
 
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
     fun connectToWifi(
         ssid: String,
         password: String,
         onConnected: () -> Unit,
         onFailed: (String) -> Unit
     ) {
+        val cleanSsid = ssid.removeSurrounding("\"").trim()
+        val cleanPass = password.removeSurrounding("\"").trim()
+
+        if (!wifiManager.isWifiEnabled) {
+            openWifiPanel()
+            onFailed("ابتدا وای‌فای گوشی را روشن کنید و دوباره QR را اسکن کنید")
+            return
+        }
+
+        // اگر از قبل به همین هات‌اسپات وصل هستیم، مستقیم ادامه بده
+        val currentSsid = runCatching {
+            wifiManager.connectionInfo?.ssid?.removeSurrounding("\"")?.trim()
+        }.getOrNull()
+        if (currentSsid == cleanSsid) {
+            onConnected()
+            return
+        }
+
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             openWifiPanel()
-            onFailed("در اندروید ۸ و ۹ لطفاً به شبکه $ssid با رمز $password وصل شوید")
+            onFailed("لطفاً دستی به وای‌فای $cleanSsid با رمز $cleanPass وصل شوید")
             return
         }
 
         disconnectWifi()
 
         val specifier = WifiNetworkSpecifier.Builder()
-            .setSsid(ssid)
-            .setWpa2Passphrase(password)
+            .setSsid(cleanSsid)
+            .setWpa2Passphrase(cleanPass)
             .build()
 
         val request = NetworkRequest.Builder()
@@ -120,14 +142,14 @@ class WifiHotspotManager(private val context: Context) {
             override fun onUnavailable() {
                 super.onUnavailable()
                 Handler(Looper.getMainLooper()).post {
-                    onFailed("اتصال به وای‌فای $ssid لغو شد یا برقرار نشد")
+                    onFailed("اتصال خودکار وای‌فای انجام نشد؛ دستی به $cleanSsid وصل شوید")
                 }
             }
         }
 
         activeNetworkCallback = callback
         runCatching {
-            connectivityManager.requestNetwork(request, callback)
+            connectivityManager.requestNetwork(request, callback, 20000)
         }.onFailure {
             onFailed("خطا در درخواست اتصال وای‌فای")
         }
