@@ -75,6 +75,8 @@ class MainActivity : ComponentActivity() {
     private var isConnected by mutableStateOf(false)
     private var isHost by mutableStateOf(false)
     private var isRelay by mutableStateOf(false)
+    private var isLocalHotspotOn by mutableStateOf(false)
+    private var isSharedWifiMode by mutableStateOf(false)
     private var isDeputy by mutableStateOf(false)
     private var deputyUserId by mutableStateOf<String?>(null)
     private var isReconnecting by mutableStateOf(false)
@@ -202,7 +204,7 @@ class MainActivity : ComponentActivity() {
                         "settings" -> SettingsScreen(
                             settings = currentSettings,
                             isConnected = isConnected,
-                            staApSupported = udpDiscovery.isStaApConcurrencySupported(),
+                            staApSupported = wifiHotspotManager.isStaApConcurrencySupported(),
                             onSaveNickname = { nick -> lifecycleScope.launch { userPrefs.saveNickname(nick) } },
                             onVolumeChange = { v -> lifecycleScope.launch { userPrefs.setOutputVolume(v) } },
                             onRogerBeepToggle = { e -> lifecycleScope.launch { userPrefs.setRogerBeep(e) } },
@@ -227,11 +229,13 @@ class MainActivity : ComponentActivity() {
                             localCameraFrame = localCamFrame,
                             isHost = isHost,
                             isRelay = isRelay,
+                            isLocalHotspotOn = isLocalHotspotOn,
+                            isSharedWifiMode = isSharedWifiMode,
                             isDeputy = isDeputy,
                             deputyUserId = deputyUserId,
                             isReconnecting = isReconnecting,
                             isConnected = isConnected,
-                            staApSupported = udpDiscovery.isStaApConcurrencySupported(),
+                            staApSupported = wifiHotspotManager.isStaApConcurrencySupported(),
                             isFullAccessAllowed = isFullAccessAllowed,
                             isActivated = isActivated,
                             remainingTrialHours = remainingTrialHours,
@@ -251,6 +255,7 @@ class MainActivity : ComponentActivity() {
                                 ok
                             },
                             onCreateNetwork = { createLocalNetwork() },
+                            onToggleLocalHotspot = { toggleHostLocalHotspot() },
                             onJoinNetwork = { ip, port, code ->
                                 val gwIp = wifiHotspotManager.getWifiGatewayIp()
                                 joinLocalNetworkWithFallback(ip, gwIp, port, code)
@@ -309,7 +314,7 @@ class MainActivity : ComponentActivity() {
         runCatching {
             val options = ScanOptions().apply {
                 setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                setPrompt("دوربین را روی QR کد گوشی مرکزی بگیرید")
+                setPrompt("دوربین را روی QR کد گوشی مرکزی یا واسطه بگیرید")
                 setBeepEnabled(false)
                 setOrientationLocked(false)
             }
@@ -411,20 +416,54 @@ class MainActivity : ComponentActivity() {
         return findRealLocalIp(preferHotspot = false) ?: "192.168.43.1"
     }
 
+    // ۱. ایجاد شبکه موج بدون روشن کردن خودکار هات‌اسپات (کارکرد روی وای‌فای مشترک)
     private fun createLocalNetwork() {
+        val wifiIp = findRealLocalIp(preferHotspot = false)
+        if (wifiIp.isNullOrBlank()) {
+            Toast.makeText(
+                this,
+                "به وای‌فای متصل نیستید! ابتدا به مودم وصل شوید یا پس از ایجاد شبکه، هات‌اسپات محلی را روشن کنید.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        val effectiveIp = wifiIp ?: "192.168.43.1"
+        isSharedWifiMode = wifiHotspotManager.isConnectedToWifi()
+        isLocalHotspotOn = wifiHotspotManager.isHotspotActive
+        startHostServer(creds = null, myIp = effectiveIp)
+    }
+
+    // ۲. دکمه مستقل روشن/خاموش کردن هات‌اسپات محلی بدون قطع سرور موج
+    private fun toggleHostLocalHotspot() {
+        val code = activeJoinCode
+        if (!isHost || code == null) {
+            Toast.makeText(this, "ابتدا شبکه موج را ایجاد کنید", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        if (isLocalHotspotOn) {
+            wifiHotspotManager.stopLocalHotspot()
+            isLocalHotspotOn = false
+            val wifiIp = findRealLocalIp(preferHotspot = false) ?: "192.168.43.1"
+            hotspotInfo = "هات‌اسپات محلی خاموش است (وای‌فای مشترک: $wifiIp)"
+            qrBitmap = generateQrBitmap("MOJ#$wifiIp#45455#$code")
+            Toast.makeText(this, "هات‌اسپات محلی خاموش شد؛ سرور موج همچنان فعال است", Toast.LENGTH_SHORT).show()
+            return
+        }
+
         Toast.makeText(this, "در حال روشن کردن هات‌اسپات محلی...", Toast.LENGTH_SHORT).show()
         wifiHotspotManager.startLocalHotspot(
             onStarted = { creds ->
                 lifecycleScope.launch {
-                    val realIp = waitForHotspotIp()
-                    startHostServer(creds, realIp)
+                    val apIp = waitForHotspotIp()
+                    isLocalHotspotOn = true
+                    hotspotInfo = "هات‌اسپات روشن: ${creds.ssid} \vert{} رمز: ${creds.password}"
+                    qrBitmap = generateQrBitmap("MOJ_WIFI#$apIp#45455#$code#${creds.ssid}#${creds.password}")
+                    Toast.makeText(this@MainActivity, "هات‌اسپات محلی روشن شد (بدون قطع اعضای فعلی)", Toast.LENGTH_LONG).show()
                 }
             },
-            onFailed = {
-                val realIp = findRealLocalIp(preferHotspot = true)
-                    ?: findRealLocalIp(preferHotspot = false)
-                    ?: "192.168.43.1"
-                startHostServer(null, realIp)
+            onFailed = { msg ->
+                isLocalHotspotOn = false
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             }
         )
     }
@@ -440,12 +479,15 @@ class MainActivity : ComponentActivity() {
         isReconnecting = false
         approvedUserIds.clear()
         approvedUserIds.add(currentSettings.userId)
+        memberManager.clearAll()
 
         if (creds != null) {
-            hotspotInfo = "وای‌فای: ${creds.ssid} | رمز: ${creds.password}"
+            isLocalHotspotOn = true
+            hotspotInfo = "هات‌اسپات روشن: ${creds.ssid} \vert{} رمز: ${creds.password}"
             qrBitmap = generateQrBitmap("MOJ_WIFI#$myIp#45455#$code#${creds.ssid}#${creds.password}")
         } else {
-            hotspotInfo = "متصل به هات‌اسپات/وای‌فای فعلی گوشی"
+            isLocalHotspotOn = false
+            hotspotInfo = if (isSharedWifiMode) "متصل به وای‌فای مشترک ($myIp) - هات‌اسپات خاموش" else "سرور موج فعال روی $myIp"
             qrBitmap = generateQrBitmap("MOJ#$myIp#45455#$code")
         }
 
@@ -455,34 +497,50 @@ class MainActivity : ComponentActivity() {
         udpDiscovery.startBroadcasting(lifecycleScope, activeNetworkName)
         pttEngine.initializePlayback()
         runCatching { MojForegroundService.start(this, "مدیر شبکه: $myIp (کد: $code)") }
-        Toast.makeText(this, "شبکه آماده است! آیکن QR بالا را بزنید", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "شبکه موج ایجاد شد! آیکن QR بالا را بزنید", Toast.LENGTH_LONG).show()
     }
 
+    // ۳. حالت واسطه واقعی (Relay) با بررسی STA + AP
     private fun toggleRelayMode() {
         val code = activeJoinCode ?: return
         if (isRelay) {
             wifiHotspotManager.stopLocalHotspot()
             isRelay = false
+            isLocalHotspotOn = false
             qrBitmap = null
             hotspotInfo = null
             Toast.makeText(this, "حالت واسطه خاموش شد", Toast.LENGTH_SHORT).show()
             return
         }
 
-        Toast.makeText(this, "در حال روشن کردن هات‌اسپات واسطه...", Toast.LENGTH_SHORT).show()
+        if (!wifiHotspotManager.isStaApConcurrencySupported()) {
+            Toast.makeText(
+                this,
+                "سخت‌افزار یا نسخه اندروید این گوشی از وای‌فای و هات‌اسپات هم‌زمان (STA+AP) پشتیبانی نمی‌کند.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        Toast.makeText(this, "در حال فعال‌سازی گره واسطه (Mesh Relay)...", Toast.LENGTH_SHORT).show()
+        wifiHotspotManager.unbindProcessForRelay()
         wifiHotspotManager.startLocalHotspot(
             onStarted = { creds ->
                 lifecycleScope.launch {
                     val myApIp = waitForHotspotIp()
                     meshRouter.startRelayServer(lifecycleScope)
+                    udpDiscovery.startBroadcasting(lifecycleScope, "موج-واسطه (${currentSettings.nickname})")
                     isRelay = true
-                    hotspotInfo = "واسطه: ${creds.ssid} | رمز: ${creds.password}"
+                    isLocalHotspotOn = true
+                    hotspotInfo = "واسطه فعال: ${creds.ssid} \vert{} رمز: ${creds.password}"
                     qrBitmap = generateQrBitmap("MOJ_WIFI#$myApIp#45455#$code#${creds.ssid}#${creds.password}")
-                    Toast.makeText(this@MainActivity, "حالت واسطه فعال شد!", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "حالت واسطه فعال شد! گوشی بعدی می‌تواند QR شما را اسکن کند", Toast.LENGTH_LONG).show()
                 }
             },
             onFailed = { msg ->
-                Toast.makeText(this, "امکان فعال‌سازی واسطه روی این گوشی نیست: $msg", Toast.LENGTH_LONG).show()
+                isRelay = false
+                isLocalHotspotOn = false
+                Toast.makeText(this, "امکان فعال‌سازی واسطه نیست: $msg", Toast.LENGTH_LONG).show()
             }
         )
     }
@@ -503,253 +561,3 @@ class MainActivity : ComponentActivity() {
         val code = activeJoinCode ?: return
         val myIp = findRealLocalIp(preferHotspot = isRelay) ?: "192.168.43.1"
         isHost = true
-        isDeputy = false
-        isReconnecting = false
-        activeNetworkName = "موج - جانشین ($myIp)"
-
-        meshRouter.startRelayServer(lifecycleScope)
-        memberManager.registerHost(currentSettings.userId, currentSettings.nickname, myIp)
-        udpDiscovery.startBroadcasting(lifecycleScope, activeNetworkName)
-        if (qrBitmap == null) {
-            qrBitmap = generateQrBitmap("MOJ#$myIp#45455#$code")
-        }
-        sendPacket(PacketType.MEMBER_LIST_SYNC, "HOST_TAKEOVER#$myIp#45455".toByteArray(Charsets.UTF_8))
-        runCatching { MojForegroundService.start(this, "مدیر جدید (جانشین): $myIp") }
-        Toast.makeText(this, "مدیر اصلی قطع شد؛ شما اکنون مدیر شبکه هستید!", Toast.LENGTH_LONG).show()
-    }
-
-    private fun joinLocalNetworkWithFallback(primaryIp: String, fallbackIp: String?, port: Int, code: String) {
-        activeJoinCode = code
-        isHost = false
-        meshRouter.setNetworkKey(code)
-        Toast.makeText(this, "در حال اتصال به $primaryIp ...", Toast.LENGTH_SHORT).show()
-        meshRouter.connectToPeer(lifecycleScope, primaryIp, port) { ok ->
-            if (ok) {
-                isReconnecting = false
-                sendPacket(PacketType.JOIN_REQUEST, currentSettings.nickname.toByteArray())
-                Toast.makeText(this, "درخواست ارسال شد؛ مدیر باید تأیید کند", Toast.LENGTH_LONG).show()
-                runCatching { MojForegroundService.start(this, "متصل به شبکه موج") }
-            } else if (!fallbackIp.isNullOrBlank() && fallbackIp != primaryIp) {
-                joinLocalNetwork(fallbackIp, port, code)
-            } else {
-                Toast.makeText(this, "اتصال به $primaryIp برقرار نشد! دیتای سیم‌کارت را خاموش و وای‌فای را بررسی کنید", Toast.LENGTH_LONG).show()
-            }
-        }
-    }
-
-    private fun joinLocalNetwork(hostIp: String, port: Int, code: String) {
-        activeJoinCode = code
-        isHost = false
-        meshRouter.setNetworkKey(code)
-        Toast.makeText(this, "در حال اتصال به $hostIp ...", Toast.LENGTH_SHORT).show()
-        meshRouter.connectToPeer(lifecycleScope, hostIp, port) { ok ->
-            if (ok) {
-                isReconnecting = false
-                sendPacket(PacketType.JOIN_REQUEST, currentSettings.nickname.toByteArray())
-                Toast.makeText(this, "درخواست ارسال شد؛ مدیر باید تأیید کند", Toast.LENGTH_LONG).show()
-                runCatching { MojForegroundService.start(this, "متصل به شبکه موج") }
-            } else {
-                Toast.makeText(this, "اتصال به $hostIp برقرار نشد! اتصال وای‌فای را بررسی کنید", Toast.LENGTH_LONG).show()
-            }
-        }
-    }
-
-    private fun approveMember(userId: String) {
-        approvedUserIds.add(userId)
-        memberManager.approveMember(userId)
-        sendPacket(PacketType.JOIN_APPROVED, userId.toByteArray(), targetId = userId)
-        syncApprovedList()
-    }
-
-    private fun rejectMember(userId: String) {
-        approvedUserIds.remove(userId)
-        memberManager.rejectMember(userId)
-        sendPacket(PacketType.JOIN_REJECTED, userId.toByteArray(), targetId = userId)
-    }
-
-    private fun kickMember(userId: String) {
-        approvedUserIds.remove(userId)
-        memberManager.kickMember(userId)
-        sendPacket(PacketType.MEMBER_KICKED, userId.toByteArray(), targetId = userId)
-        syncApprovedList()
-    }
-
-    private fun sendTextMessage(text: String) {
-        sendPacket(PacketType.TEXT_MESSAGE, text.toByteArray(Charsets.UTF_8))
-        addChatItem(currentSettings.nickname, text, isMine = true)
-    }
-
-    private fun sendPacket(type: PacketType, payload: ByteArray, targetId: String? = null) {
-        val packet = MeshPacket(
-            type = type,
-            senderId = currentSettings.userId,
-            senderNickname = currentSettings.nickname,
-            targetId = targetId,
-            payload = payload
-        )
-        lifecycleScope.launch(Dispatchers.IO) {
-            meshRouter.broadcastPacket(packet)
-        }
-    }
-
-    private fun handleIncomingPacket(packet: MeshPacket, peerIp: String) {
-        if (packet.targetId != null && packet.targetId != currentSettings.userId) return
-
-        when (packet.type) {
-            PacketType.JOIN_REQUEST -> {
-                if (isHost) {
-                    if (approvedUserIds.contains(packet.senderId)) {
-                        memberManager.addJoinRequest(packet.senderId, packet.senderNickname, peerIp)
-                        approveMember(packet.senderId)
-                    } else {
-                        memberManager.addJoinRequest(packet.senderId, packet.senderNickname, peerIp)
-                        notifyIfEnabled("درخواست ورود جدید", "${packet.senderNickname} می‌خواهد به شبکه بپیوندد")
-                    }
-                }
-            }
-            PacketType.JOIN_APPROVED -> {
-                runOnUiThread {
-                    isConnected = true
-                    isReconnecting = false
-                    pttEngine.initializePlayback()
-                    memberManager.registerHost(packet.senderId, packet.senderNickname, peerIp)
-                    memberManager.addJoinRequest(currentSettings.userId, currentSettings.nickname, findRealLocalIp(false) ?: "192.168.43.1")
-                    memberManager.approveMember(currentSettings.userId)
-                    Toast.makeText(this, "اتصال به شبکه برقرار شد!", Toast.LENGTH_SHORT).show()
-                }
-            }
-            PacketType.JOIN_REJECTED, PacketType.MEMBER_KICKED -> {
-                runOnUiThread { disconnectNetwork() }
-            }
-            PacketType.TEXT_MESSAGE -> {
-                val text = String(packet.payload, Charsets.UTF_8)
-                runOnUiThread { addChatItem(packet.senderNickname, text, isMine = false) }
-                notifyIfEnabled("پیام از ${packet.senderNickname}", text)
-            }
-            PacketType.VOICE_PTT_FRAME -> pttEngine.onRemoteAudioReceived(packet.senderNickname, packet.payload)
-            PacketType.VOICE_PTT_END -> pttEngine.onRemoteTransmitEnded()
-            PacketType.FILE_CHUNK -> fileTransfer.onChunkReceived(packet.payload)
-            PacketType.CAMERA_VIEW_RESPONSE -> memberManager.updateCameraSharing(packet.senderId, true)
-            PacketType.CAMERA_LIVE_FRAME -> {
-                if (packet.senderId != currentSettings.userId) {
-                    cameraEngine.onRemoteFrameReceived(packet.senderId, packet.senderNickname, packet.payload)
-                }
-            }
-            PacketType.CAMERA_STOPPED -> {
-                memberManager.updateCameraSharing(packet.senderId, false)
-                cameraEngine.stopWatchingRemote(packet.senderId)
-            }
-            PacketType.MEMBER_LIST_SYNC -> {
-                val msg = String(packet.payload, Charsets.UTF_8)
-                val parts = msg.split("#")
-                when (parts.firstOrNull()) {
-                    "DEPUTY_SET" -> {
-                        val depId = parts.getOrNull(1)
-                        runOnUiThread {
-                            deputyUserId = depId
-                            isDeputy = (depId == currentSettings.userId)
-                            if (isDeputy) {
-                                Toast.makeText(this, "شما به عنوان جانشین شبکه انتخاب شدید", Toast.LENGTH_LONG).show()
-                            }
-                        }
-                    }
-                    "APPROVED_SYNC" -> {
-                        val ids = parts.getOrNull(1)?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
-                        approvedUserIds.addAll(ids)
-                    }
-                    "HOST_TAKEOVER" -> {
-                        val newIp = parts.getOrNull(1) ?: return
-                        val newPort = parts.getOrNull(2)?.toIntOrNull() ?: 45455
-                        val code = activeJoinCode ?: return
-                        if (!isHost) {
-                            runOnUiThread {
-                                Toast.makeText(this, "جانشین مدیریت شبکه را بر عهده گرفت؛ اتصال به $newIp", Toast.LENGTH_SHORT).show()
-                                joinLocalNetwork(newIp, newPort, code)
-                            }
-                        }
-                    }
-                }
-            }
-            PacketType.CAMERA_VIEW_REQUEST -> Unit
-        }
-    }
-
-    private fun getFileNameFromUri(uri: Uri, fallback: String): String {
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (nameIdx >= 0 && cursor.moveToFirst()) {
-                val name = cursor.getString(nameIdx)
-                if (!name.isNullOrBlank()) return name
-            }
-        }
-        return fallback
-    }
-
-    private fun copyUriAndSend(uri: Uri, fallbackName: String) {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val realName = getFileNameFromUri(uri, fallbackName)
-            val outFile = File(cacheDir, realName)
-            contentResolver.openInputStream(uri)?.use { input ->
-                FileOutputStream(outFile).use { output -> input.copyTo(output) }
-            }
-            fileTransfer.sendFile(lifecycleScope, outFile)
-        }
-    }
-
-    private fun addChatItem(sender: String, text: String, isMine: Boolean) {
-        val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
-        chatMessages.add(ChatItem(UUID.randomUUID().toString(), sender, text, isMine, time))
-    }
-
-    private fun notifyIfEnabled(title: String, msg: String) {
-        if (currentSettings.notificationsEnabled) {
-            MojForegroundService.notifyEvent(this, title, msg)
-        }
-    }
-
-    private fun disconnectNetwork() {
-        deputyFailoverJob?.cancel()
-        isConnected = false
-        isHost = false
-        isRelay = false
-        isDeputy = false
-        deputyUserId = null
-        isReconnecting = false
-        activeJoinCode = null
-        hotspotInfo = null
-        qrBitmap = null
-        approvedUserIds.clear()
-        udpDiscovery.stopBroadcasting()
-        meshRouter.stopAll()
-        cameraEngine.stopSharing()
-        cameraEngine.stopWatchingAll()
-        wifiHotspotManager.release()
-        MojForegroundService.stop(this)
-    }
-
-    private fun requestRequiredPermissions() {
-        val perms = mutableListOf(
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.CAMERA
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            perms.add(Manifest.permission.POST_NOTIFICATIONS)
-            perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-        } else {
-            perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
-        }
-        permissionLauncher.launch(perms.toTypedArray())
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        deputyFailoverJob?.cancel()
-        pttEngine.release()
-        voiceRecorderPlayer.stopPlayback()
-        cameraEngine.release()
-        udpDiscovery.stopBroadcasting()
-        udpDiscovery.stopListening()
-        meshRouter.stopAll()
-        wifiHotspotManager.release()
-    }
-}
