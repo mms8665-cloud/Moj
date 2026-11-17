@@ -22,21 +22,25 @@ class MemberManager {
             ipAddress = ip,
             isHost = true,
             isApproved = true,
-            isOnline = true
+            isOnline = true,
+            hopCount = 0
         )
         membersMap[userId] = host
         publishState()
     }
 
-    fun addJoinRequest(userId: String, nickname: String, ip: String): Boolean {
+    fun addJoinRequest(userId: String, nickname: String, ip: String, hopCount: Int = 0): Boolean {
         if (revokedUserIds.contains(userId)) return false
+        val existing = membersMap[userId]
         val candidate = NetworkMember(
             userId = userId,
             nickname = nickname,
             ipAddress = ip,
-            isHost = false,
-            isApproved = false,
-            isOnline = true
+            isHost = existing?.isHost ?: false,
+            isApproved = existing?.isApproved ?: false,
+            isOnline = true,
+            isSharingCamera = existing?.isSharingCamera ?: false,
+            hopCount = hopCount
         )
         membersMap[userId] = candidate
         publishState()
@@ -82,6 +86,12 @@ class MemberManager {
     fun syncMembersFromHost(list: List<NetworkMember>) {
         membersMap.clear()
         list.forEach { membersMap[it.userId] = it }
+        publishState()
+    }
+
+    fun clearAll() {
+        membersMap.clear()
+        revokedUserIds.clear()
         publishState()
     }
 
