@@ -27,8 +27,9 @@ data class MeshPacket(
     val type: PacketType,
     val senderId: String,
     val senderNickname: String,
-    val targetId: String? = null, // null = broadcast to all approved members
-    val ttl: Int = 5,             // حداکثر پرش Relay برای جلوگیری از حلقه
+    val targetId: String? = null,
+    val ttl: Int = 5,
+    val hopCount: Int = 0,
     val timestamp: Long = System.currentTimeMillis(),
     val payload: ByteArray
 )
@@ -40,5 +41,6 @@ data class NetworkMember(
     val isHost: Boolean = false,
     val isApproved: Boolean = false,
     val isOnline: Boolean = true,
-    val isSharingCamera: Boolean = false
+    val isSharingCamera: Boolean = false,
+    val hopCount: Int = 0 // 0 = مستقیم، بزرگ‌تر از 0 = از طریق واسطه
 )
