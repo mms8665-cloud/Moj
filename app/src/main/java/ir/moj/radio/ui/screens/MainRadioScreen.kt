@@ -69,6 +69,8 @@ fun MainRadioScreen(
     localCameraFrame: Bitmap?,
     isHost: Boolean,
     isRelay: Boolean,
+    isLocalHotspotOn: Boolean,
+    isSharedWifiMode: Boolean,
     isDeputy: Boolean,
     deputyUserId: String?,
     isReconnecting: Boolean,
@@ -89,6 +91,7 @@ fun MainRadioScreen(
     discoveredNetworks: List<DiscoveredNetwork>,
     onActivateApp: (String) -> Boolean,
     onCreateNetwork: () -> Unit,
+    onToggleLocalHotspot: () -> Unit,
     onJoinNetwork: (hostIp: String, port: Int, code: String) -> Unit,
     onScanQrCode: () -> Unit,
     onOpenWifiPanel: () -> Unit,
@@ -288,7 +291,17 @@ fun MainRadioScreen(
                     }
                 } else {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        if (!isHost && staApSupported) {
+                        if (isHost) {
+                            FilledTonalButton(
+                                onClick = onToggleLocalHotspot,
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                colors = ButtonDefaults.filledTonalButtonColors(
+                                    containerColor = if (isLocalHotspotOn) MojGreenOnline.copy(alpha = 0.25f) else MojNavySurface
+                                )
+                            ) {
+                                Text(if (isLocalHotspotOn) "هات‌اسپات: روشن" else "هات‌اسپات محلی", fontSize = 11.sp)
+                            }
+                        } else {
                             FilledTonalButton(
                                 onClick = onToggleRelayMode,
                                 contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
@@ -910,7 +923,7 @@ fun MainRadioScreen(
     if (showQrDialog && qrBitmap != null) {
         AlertDialog(
             onDismissRequest = { showQrDialog = false },
-            title = { Text(if (isRelay) "QR کد گوشی واسطه (ادامه شبکه)" else "QR کد اتصال خودکار به شبکه") },
+            title = { Text(if (isRelay) "QR کد گوشی واسطه (ادامه شبکه)" else "QR کد اتصال به شبکه موج") },
             text = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
                     Image(
@@ -947,7 +960,7 @@ fun MainRadioScreen(
             title = { Text("اتصال به شبکه موج با کد") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("ابتدا به وای‌فای/هات‌اسپات گوشی مرکزی وصل شوید، سپس کد اتصال را وارد کنید:", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("به وای‌فای مشترک یا هات‌اسپات گوشی مرکزی/واسطه وصل شوید، سپس کد اتصال را وارد کنید:", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     if (discoveredNetworks.isNotEmpty()) {
                         discoveredNetworks.forEach { net ->
                             TextButton(onClick = {
@@ -966,7 +979,7 @@ fun MainRadioScreen(
                     OutlinedTextField(
                         value = ipInput,
                         onValueChange = { ipInput = it },
-                        label = { Text("آدرس IP گوشی مرکزی (پیش‌فرض 192.168.43.1)") },
+                        label = { Text("آدرس IP گوشی مرکزی یا واسطه") },
                         singleLine = true
                     )
                 }
@@ -989,8 +1002,20 @@ fun MainRadioScreen(
 
     if (showMembersSheet) {
         ModalBottomSheet(onDismissRequest = { showMembersSheet = false }) {
+            val directCount = members.count { !it.isHost && it.hopCount == 0 }
+            val relayedCount = members.count { !it.isHost && it.hopCount > 0 }
             Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                 Text("اعضای شبکه (${members.size})", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text(
+                    text = "اتصال مستقیم: $directCount | از طریق واسطه: $relayedCount",
+                    fontSize = 12.sp,
+                    color = MojCyan
+                )
+                Text(
+                    text = "هات‌اسپات محلی: ${if (isLocalHotspotOn) "روشن" else "خاموش"} | حالت: ${if (isRelay) "واسطه (Relay)" else if (isSharedWifiMode) "وای‌فای مشترک" else "محلی"}",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
                 Text(
                     text = if (staApSupported) "پشتیبانی هم‌زمان Wi-Fi + Hotspot (واسطه): فعال" else "این گوشی هم‌زمانی Wi-Fi و Hotspot را پشتیبانی نمی‌کند",
                     fontSize = 11.sp,
@@ -999,14 +1024,15 @@ fun MainRadioScreen(
                 Spacer(modifier = Modifier.height(10.dp))
 
                 if (isHost && pendingJoinRequests.isNotEmpty()) {
-                    Text("درخواست‌های در انتظار تأیید:", color = MojCyan, fontSize = 13.sp)
+                    Text("درخواست‌های در انتظار تأیید (${pendingJoinRequests.size}):", color = MojCyan, fontSize = 13.sp)
                     pendingJoinRequests.forEach { req ->
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(req.nickname)
+                            val via = if (req.hopCount > 0) " (واسطه‌ای)" else " (مستقیم)"
+                            Text("${req.nickname}$via")
                             Row {
                                 TextButton(onClick = { onApproveMember(req.userId) }) { Text("تأیید", color = MojGreenOnline) }
                                 TextButton(onClick = { onRejectMember(req.userId) }) { Text("رد", color = MojRedAlert) }
@@ -1027,7 +1053,8 @@ fun MainRadioScreen(
                             val badge = when {
                                 member.isHost -> "(مدیر)"
                                 isThisDeputy -> "(جانشین)"
-                                else -> ""
+                                member.hopCount > 0 -> "(واسطه‌ای)"
+                                else -> "(مستقیم)"
                             }
                             Text("${member.nickname} $badge", fontWeight = FontWeight.Medium)
                             Text(if (member.isOnline) "آنلاین" else "آفلاین", fontSize = 11.sp, color = MojGreenOnline)
