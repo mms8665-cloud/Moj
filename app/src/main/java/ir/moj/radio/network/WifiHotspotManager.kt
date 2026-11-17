@@ -29,6 +29,23 @@ class WifiHotspotManager(private val context: Context) {
     private var activeNetworkCallback: ConnectivityManager.NetworkCallback? = null
     private var boundNetwork: Network? = null
 
+    val isHotspotActive: Boolean
+        get() = hotspotReservation != null
+
+    fun isStaApConcurrencySupported(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching { wifiManager.isStaApConcurrencySupported }.getOrDefault(false)
+        } else {
+            false
+        }
+    }
+
+    fun isConnectedToWifi(): Boolean {
+        val net = boundNetwork ?: connectivityManager.activeNetwork ?: return false
+        val caps = connectivityManager.getNetworkCapabilities(net) ?: return false
+        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    }
+
     fun openWifiPanel() {
         val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             Intent(Settings.Panel.ACTION_WIFI)
@@ -38,7 +55,6 @@ class WifiHotspotManager(private val context: Context) {
         runCatching { context.startActivity(intent) }
     }
 
-    // پیدا کردن IP واقعی گوشی مرکزی (Gateway) پس از اتصال وای‌فای
     @Suppress("DEPRECATION")
     fun getWifiGatewayIp(): String? {
         runCatching {
@@ -96,7 +112,14 @@ class WifiHotspotManager(private val context: Context) {
 
                 override fun onFailed(reason: Int) {
                     super.onFailed(reason)
-                    onFailed("امکان روشن کردن هات‌اسپات محلی وجود ندارد (کد $reason)")
+                    val reasonText = when (reason) {
+                        ERROR_NO_CHANNEL -> "کانال وای‌فای آزاد نیست"
+                        ERROR_GENERIC -> "خطای سیستم‌عامل در روشن کردن هات‌اسپات"
+                        ERROR_INCOMPATIBLE_MODE -> "حالت فعلی وای‌فای با هات‌اسپات هم‌زمان سازگار نیست"
+                        ERROR_TETHERING_DISALLOWED -> "مجوز هات‌اسپات توسط سیستم مسدود است"
+                        else -> "کد خطا: $reason"
+                    }
+                    onFailed("امکان روشن کردن هات‌اسپات نیست ($reasonText)")
                 }
             }, Handler(Looper.getMainLooper()))
         } catch (e: Exception) {
@@ -177,6 +200,10 @@ class WifiHotspotManager(private val context: Context) {
         } catch (e: Exception) {
             onFailed("خطا در اتصال وای‌فای: ${e.message ?: "نامشخص"}")
         }
+    }
+
+    fun unbindProcessForRelay() {
+        runCatching { connectivityManager.bindProcessToNetwork(null) }
     }
 
     fun disconnectWifi() {
