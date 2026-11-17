@@ -2,15 +2,16 @@ package ir.moj.radio.network
 
 import android.util.Log
 import ir.moj.radio.data.MeshPacket
+import ir.moj.radio.data.PacketType
 import ir.moj.radio.security.CryptoManager
 import kotlinx.coroutines.*
 import java.io.*
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
-import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
@@ -22,8 +23,23 @@ class MeshRouter(
     private val memberManager: MemberManager,
     private val onPacketReceived: (MeshPacket, String) -> Unit
 ) {
-    private val activeConnections = ConcurrentHashMap<String, Socket>()
-    private val seenPacketIds = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+    private data class PeerConnection(
+        val id: String,
+        val ip: String,
+        val socket: Socket,
+        val isUpstream: Boolean
+    )
+
+    private val activeConnections = ConcurrentHashMap<String, PeerConnection>()
+
+    // کش LRU ضدتکرار و ضدحلقه
+    private val seenLock = Any()
+    private val seenPacketIds = object : LinkedHashMap<String, Boolean>(3000, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?): Boolean {
+            return size > 3000
+        }
+    }
+
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
     private var reconnectJob: Job? = null
@@ -42,23 +58,33 @@ class MeshRouter(
         secretKey = SecretKeySpec(hash, "AES")
     }
 
+    fun getDirectPeerCount(): Int = activeConnections.size
+
     fun startServer(scope: CoroutineScope, port: Int = 45455) {
         stopAll()
         manualDisconnect = false
         startRelayServer(scope, port)
     }
 
-    // روشن کردن سرور روی گوشی واسطه یا جانشین بدون قطع کردن اتصال‌های فعلی
+    // Bind روی 0.0.0.0 برای پذیرش هم‌زمان کلاینت‌های وای‌فای مشترک و هات‌اسپات محلی
     fun startRelayServer(scope: CoroutineScope, port: Int = 45455) {
         if (serverSocket != null && serverSocket?.isClosed == false) return
         serverJob = scope.launch(Dispatchers.IO) {
             try {
-                serverSocket = ServerSocket(port)
+                val ss = ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(InetAddress.getByName("0.0.0.0"), port))
+                }
+                serverSocket = ss
                 while (isActive) {
-                    val socket = serverSocket?.accept() ?: break
+                    val socket = ss.accept()
+                    socket.tcpNoDelay = true
+                    socket.keepAlive = true
                     handleClientSocket(socket, isUpstream = false)
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.e("MeshRouter", "Server error: ${e.message}")
+            }
         }
     }
 
@@ -77,20 +103,19 @@ class MeshRouter(
     private fun openUpstreamSocket(scope: CoroutineScope, hostIp: String, port: Int): Boolean {
         return try {
             val socket = Socket()
-            socket.connect(InetSocketAddress(hostIp, port), 4000)
-            val peerIp = socket.inetAddress.hostAddress ?: hostIp
-            activeConnections[peerIp] = socket
+            socket.tcpNoDelay = true
+            socket.keepAlive = true
+            socket.connect(InetSocketAddress(hostIp, port), 4500)
             handleClientSocket(socket, isUpstream = true, scope = scope)
             true
         } catch (e: Exception) {
-            Log.e("MeshRouter", "Connect error: ${e.message}")
+            Log.e("MeshRouter", "Connect error to $hostIp:$port -> ${e.message}")
             false
         }
     }
 
     private fun scheduleAutoReconnect(scope: CoroutineScope) {
-        val targetIp = upstreamHostIp ?: return
-        if (manualDisconnect || reconnectJob?.isActive == true) return
+        if (upstreamHostIp == null || manualDisconnect || reconnectJob?.isActive == true) return
 
         reconnectJob = scope.launch(Dispatchers.IO) {
             while (isActive && !manualDisconnect) {
@@ -105,12 +130,23 @@ class MeshRouter(
         }
     }
 
+    private fun markPacketSeen(packetId: String): Boolean {
+        synchronized(seenLock) {
+            if (seenPacketIds.containsKey(packetId)) return false
+            seenPacketIds[packetId] = true
+            return true
+        }
+    }
+
     private fun handleClientSocket(socket: Socket, isUpstream: Boolean, scope: CoroutineScope? = null) {
+        val peerIp = socket.inetAddress?.hostAddress ?: "unknown"
+        val connId = "${peerIp}:${socket.port}:${UUID.randomUUID().toString().take(6)}"
+        val conn = PeerConnection(connId, peerIp, socket, isUpstream)
+        activeConnections[connId] = conn
+
         CoroutineScope(Dispatchers.IO).launch {
-            val peerIp = socket.inetAddress.hostAddress ?: "unknown"
-            activeConnections[peerIp] = socket
             try {
-                val input = DataInputStream(socket.getInputStream())
+                val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
                 while (socket.isConnected && !socket.isClosed) {
                     val encryptedLen = input.readInt()
                     if (encryptedLen <= 0 || encryptedLen > 20 * 1024 * 1024) break
@@ -118,17 +154,24 @@ class MeshRouter(
                     input.readFully(encryptedBytes)
 
                     val plainBytes = decryptBytes(encryptedBytes) ?: continue
-                    val (packetId, packet) = deserializePacket(plainBytes) ?: continue
+                    val packet = deserializePacket(plainBytes) ?: continue
 
-                    if (!seenPacketIds.add(packetId)) continue
-                    if (seenPacketIds.size > 1500) seenPacketIds.clear()
+                    if (!markPacketSeen(packet.packetId)) continue
 
                     onPacketReceived(packet, peerIp)
-                    relayPacketToOthers(packetId, packet, excludeIp = peerIp)
+
+                    // بازپخش به سایر گره‌ها در صورت باقی ماندن TTL
+                    if (packet.ttl > 1) {
+                        val forwarded = packet.copy(
+                            ttl = packet.ttl - 1,
+                            hopCount = packet.hopCount + 1
+                        )
+                        relayPacketToOthers(forwarded, excludeConnId = connId)
+                    }
                 }
             } catch (_: Exception) {
             } finally {
-                activeConnections.remove(peerIp)
+                activeConnections.remove(connId)
                 runCatching { socket.close() }
                 if (isUpstream && !manualDisconnect && scope != null) {
                     withContext(Dispatchers.Main) { onUpstreamDisconnected?.invoke() }
@@ -139,76 +182,80 @@ class MeshRouter(
     }
 
     fun broadcastPacket(packet: MeshPacket) {
-        val packetId = UUID.randomUUID().toString()
-        seenPacketIds.add(packetId)
-        val plainBytes = serializePacket(packetId, packet)
+        markPacketSeen(packet.packetId)
+        val plainBytes = serializePacket(packet)
         val encrypted = encryptBytes(plainBytes) ?: return
 
-        activeConnections.values.forEach { socket ->
-            CoroutineScope(Dispatchers.IO).launch {
-                runCatching {
-                    synchronized(socket) {
-                        val output = DataOutputStream(socket.getOutputStream())
-                        output.writeInt(encrypted.size)
-                        output.write(encrypted)
-                        output.flush()
-                    }
-                }
+        activeConnections.values.forEach { conn ->
+            sendEncryptedToConnection(conn, encrypted)
+        }
+    }
+
+    private fun relayPacketToOthers(packet: MeshPacket, excludeConnId: String) {
+        val plainBytes = serializePacket(packet)
+        val encrypted = encryptBytes(plainBytes) ?: return
+
+        activeConnections.values.forEach { conn ->
+            if (conn.id != excludeConnId) {
+                sendEncryptedToConnection(conn, encrypted)
             }
         }
     }
 
-    private fun relayPacketToOthers(packetId: String, packet: MeshPacket, excludeIp: String) {
-        val plainBytes = serializePacket(packetId, packet)
-        val encrypted = encryptBytes(plainBytes) ?: return
-
-        activeConnections.forEach { (ip, socket) ->
-            if (ip != excludeIp) {
-                CoroutineScope(Dispatchers.IO).launch {
-                    runCatching {
-                        synchronized(socket) {
-                            val output = DataOutputStream(socket.getOutputStream())
-                            output.writeInt(encrypted.size)
-                            output.write(encrypted)
-                            output.flush()
-                        }
-                    }
+    private fun sendEncryptedToConnection(conn: PeerConnection, encrypted: ByteArray) {
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching {
+                synchronized(conn.socket) {
+                    val output = DataOutputStream(conn.socket.getOutputStream())
+                    output.writeInt(encrypted.size)
+                    output.write(encrypted)
+                    output.flush()
                 }
+            }.onFailure {
+                activeConnections.remove(conn.id)
+                runCatching { conn.socket.close() }
             }
         }
     }
 
-    private fun serializePacket(packetId: String, packet: MeshPacket): ByteArray {
+    private fun serializePacket(packet: MeshPacket): ByteArray {
         val bos = ByteArrayOutputStream()
         DataOutputStream(bos).use { dos ->
-            dos.writeUTF(packetId)
+            dos.writeUTF(packet.packetId)
             dos.writeUTF(packet.type.name)
             dos.writeUTF(packet.senderId)
             dos.writeUTF(packet.senderNickname)
             dos.writeUTF(packet.targetId ?: "")
+            dos.writeInt(packet.ttl)
+            dos.writeInt(packet.hopCount)
             dos.writeInt(packet.payload.size)
             dos.write(packet.payload)
         }
         return bos.toByteArray()
     }
 
-    private fun deserializePacket(data: ByteArray): Pair<String, MeshPacket>? {
+    private fun deserializePacket(data: ByteArray): MeshPacket? {
         return runCatching {
             val dis = DataInputStream(ByteArrayInputStream(data))
             val packetId = dis.readUTF()
-            val type = ir.moj.radio.data.PacketType.valueOf(dis.readUTF())
+            val type = PacketType.valueOf(dis.readUTF())
             val senderId = dis.readUTF()
             val senderNickname = dis.readUTF()
             val rawTarget = dis.readUTF()
             val targetId = rawTarget.ifEmpty { null }
+            val ttl = dis.readInt()
+            val hopCount = dis.readInt()
             val payloadLen = dis.readInt()
             val payload = ByteArray(payloadLen)
             dis.readFully(payload)
-            packetId to MeshPacket(
+            MeshPacket(
+                packetId = packetId,
                 type = type,
                 senderId = senderId,
                 senderNickname = senderNickname,
                 targetId = targetId,
+                ttl = ttl,
+                hopCount = hopCount,
                 payload = payload
             )
         }.getOrNull()
@@ -246,8 +293,8 @@ class MeshRouter(
         runCatching { serverSocket?.close() }
         serverSocket = null
         serverJob?.cancel()
-        activeConnections.values.forEach { runCatching { it.close() } }
+        activeConnections.values.forEach { runCatching { it.socket.close() } }
         activeConnections.clear()
-        seenPacketIds.clear()
+        synchronized(seenLock) { seenPacketIds.clear() }
     }
 }
