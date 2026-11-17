@@ -8,7 +8,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.NetworkInterface
 
 data class DiscoveredNetwork(
     val networkName: String,
@@ -28,10 +30,28 @@ class UdpDiscovery(private val context: Context) {
     fun isStaApConcurrencySupported(): Boolean {
         val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            wifiManager.isStaApConcurrencySupported
+            runCatching { wifiManager.isStaApConcurrencySupported }.getOrDefault(false)
         } else {
             false
         }
+    }
+
+    private fun getAllBroadcastAddresses(): List<InetAddress> {
+        val targets = mutableSetOf<InetAddress>()
+        runCatching {
+            NetworkInterface.getNetworkInterfaces().toList()
+                .filter { it.isUp && !it.isLoopback }
+                .forEach { iface ->
+                    iface.interfaceAddresses.forEach { ifAddr ->
+                        val bcast = ifAddr.broadcast
+                        if (bcast is Inet4Address) {
+                            targets.add(bcast)
+                        }
+                    }
+                }
+        }
+        runCatching { targets.add(InetAddress.getByName("255.255.255.255")) }
+        return targets.toList()
     }
 
     fun startBroadcasting(scope: CoroutineScope, networkName: String, tcpPort: Int = 45455) {
@@ -40,11 +60,13 @@ class UdpDiscovery(private val context: Context) {
             val socket = DatagramSocket().apply { broadcast = true }
             try {
                 val message = "MOJ_HOST#$networkName#$tcpPort".toByteArray(Charsets.UTF_8)
-                val broadcastAddr = InetAddress.getByName("255.255.255.255")
                 while (isActive) {
-                    runCatching {
-                        val packet = DatagramPacket(message, message.size, broadcastAddr, udpPort)
-                        socket.send(packet)
+                    val addresses = getAllBroadcastAddresses()
+                    addresses.forEach { addr ->
+                        runCatching {
+                            val packet = DatagramPacket(message, message.size, addr, udpPort)
+                            socket.send(packet)
+                        }
                     }
                     delay(2000)
                 }
@@ -63,6 +85,7 @@ class UdpDiscovery(private val context: Context) {
                 acquire()
             }
             val socket = DatagramSocket(udpPort).apply {
+                reuseAddress = true
                 broadcast = true
                 soTimeout = 3000
             }
